@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -38,6 +38,7 @@ pub struct Profile {
     pub ports: Option<Vec<u16>>,
     pub audio: Option<bool>,
     pub dockerfile: Option<PathBuf>,
+    pub build_context: Option<PathBuf>,
     pub features: Option<Vec<Feature>>,
 }
 
@@ -73,6 +74,76 @@ pub fn get_default_features() -> Result<Vec<Feature>> {
 pub fn list_profiles() -> Result<Vec<String>> {
     let config = load_config()?;
     Ok(config.profile.into_keys().collect())
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedDockerfile {
+    pub dockerfile: PathBuf,
+    pub build_context: PathBuf,
+}
+
+fn resolve_context_dir(
+    build_context: Option<&Path>,
+    dockerfile: &Path,
+) -> Result<PathBuf> {
+    Ok(build_context.map_or_else(
+        || {
+            dockerfile
+                .parent()
+                .map(|p| p.to_path_buf())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "cannot determine build context: '{}' has no parent directory",
+                        dockerfile.display()
+                    )
+                })
+        },
+        |c| Ok(c.canonicalize().unwrap_or_else(|_| c.to_path_buf())),
+    )?)
+}
+
+pub fn resolve_dockerfile_and_context(
+    dockerfile: &Path,
+    build_context: Option<&Path>,
+) -> Result<ResolvedDockerfile> {
+    if dockerfile.is_absolute() {
+        return Ok(ResolvedDockerfile {
+            dockerfile: dockerfile.to_path_buf(),
+            build_context: resolve_context_dir(build_context, dockerfile)?,
+        });
+    }
+
+    if dockerfile.exists() {
+        let abs = dockerfile.canonicalize()?;
+        return Ok(ResolvedDockerfile {
+            dockerfile: abs.clone(),
+            build_context: resolve_context_dir(build_context, &abs)?,
+        });
+    }
+
+    let data_dir = dirs::data_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine data directory"))?;
+    let dockerfiles_dir = data_dir.join("opencode-docker/dockerfiles");
+
+    let candidates = [
+        dockerfiles_dir.join(dockerfile).join("Dockerfile"),
+        dockerfiles_dir.join(format!("{}.dockerfile", dockerfile.display())),
+    ];
+
+    for candidate in &candidates {
+        if candidate.exists() {
+            return Ok(ResolvedDockerfile {
+                dockerfile: candidate.clone(),
+                build_context: resolve_context_dir(build_context, &candidate)?,
+            });
+        }
+    }
+
+    anyhow::bail!(
+        "dockerfile '{}' not found (searched: {:?})",
+        dockerfile.display(),
+        candidates
+    )
 }
 
 #[cfg(test)]

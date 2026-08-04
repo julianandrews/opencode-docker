@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -32,6 +32,9 @@ struct Cli {
 
     #[arg(short = 'f', long = "dockerfile")]
     dockerfile: Option<PathBuf>,
+
+    #[arg(short = 'C', long = "build-context")]
+    build_context: Option<PathBuf>,
 
     #[arg(short = 'e', long = "env")]
     env: Vec<String>,
@@ -74,10 +77,6 @@ fn main() -> Result<()> {
             .with_context(|| format!("failed to load config for profile '{name}'"))?,
         None => None,
     };
-
-    let dockerfile = cli
-        .dockerfile
-        .or_else(|| profile.as_ref().and_then(|p| p.dockerfile.clone()));
 
     let mut env_vars = profile
         .as_ref()
@@ -124,7 +123,31 @@ fn main() -> Result<()> {
     let has_rust = features.contains(&Feature::Rust);
 
     check_cwd()?;
-    build_image(dockerfile.as_deref(), has_r, has_rust)?;
+
+    // Resolve dockerfile: CLI flag bypasses XDG search; profile dockerfile uses it
+    let cli_dockerfile = cli.dockerfile;
+    let cli_build_context = cli.build_context;
+    let profile_dockerfile = profile.as_ref().and_then(|p| p.dockerfile.clone());
+    let profile_build_context = profile.as_ref().and_then(|p| p.build_context.clone());
+
+    let resolved = if let Some(df) = cli_dockerfile {
+        let ctx = cli_build_context.unwrap_or_else(|| {
+            df.parent()
+                .expect("dockerfile has no parent directory")
+                .to_path_buf()
+        });
+        Some(config::ResolvedDockerfile {
+            dockerfile: df,
+            build_context: ctx,
+        })
+    } else if let Some(df) = profile_dockerfile {
+        let ctx = cli_build_context.or(profile_build_context);
+        Some(config::resolve_dockerfile_and_context(&df, ctx.as_deref())?)
+    } else {
+        None
+    };
+
+    build_image(resolved.as_ref(), has_r, has_rust)?;
 
     if has_r {
         r_setup::check_and_restore()?;
@@ -199,31 +222,61 @@ fn check_cwd() -> Result<()> {
     Ok(())
 }
 
-fn build_image(dockerfile: Option<&Path>, has_r: bool, has_rust: bool) -> Result<()> {
-    let mut cmd = std::process::Command::new("docker");
-    cmd.args(["build", "--pull", "-t", "opencode-local"]);
-
-    if has_r {
-        cmd.args(["--build-arg", "INCLUDE_R=true"]);
-    }
-    cmd.args(["--build-arg", &format!("INCLUDE_RUST={has_rust}")]);
-
-    let tmp;
-    if let Some(path) = dockerfile {
-        let dir = path
-            .parent()
-            .ok_or_else(|| anyhow!("dockerfile has no parent directory"))?;
-        cmd.arg("-f").arg(path).arg(dir);
-    } else {
-        tmp = tempfile::tempdir()?;
+fn build_image(
+    resolved: Option<&config::ResolvedDockerfile>,
+    has_r: bool,
+    has_rust: bool,
+) -> Result<()> {
+    let status = {
+        let tmp = tempfile::tempdir()?;
         let df = tmp.path().join("Dockerfile");
         std::fs::write(&df, include_str!("../docker/Dockerfile"))?;
+        let mut cmd = std::process::Command::new("docker");
+        cmd.args(["build", "--pull", "-t", "opencode-local-base"]);
+        if has_r {
+            cmd.args(["--build-arg", "INCLUDE_R=true"]);
+        }
+        cmd.args(["--build-arg", &format!("INCLUDE_RUST={has_rust}")]);
         cmd.arg(tmp.path());
+        cmd.status().context("failed to run docker build (base)")?
+    };
+    if !status.success() {
+        anyhow::bail!(
+            "docker build (base) failed (exit code: {:?})",
+            status.code()
+        );
     }
 
-    let status = cmd.status().context("failed to run docker build")?;
-    if !status.success() {
-        anyhow::bail!("docker build failed (exit code: {:?})", status.code());
+    if let Some(r) = resolved {
+        let mut cmd = std::process::Command::new("docker");
+        cmd.args(["build", "-t", "opencode-local"]);
+        if has_r {
+            cmd.args(["--build-arg", "INCLUDE_R=true"]);
+        }
+        cmd.args(["--build-arg", &format!("INCLUDE_RUST={has_rust}")]);
+        cmd.arg("-f").arg(&r.dockerfile).arg(&r.build_context);
+
+        let status = cmd
+            .status()
+            .context("failed to run docker build (custom)")?;
+        if !status.success() {
+            anyhow::bail!(
+                "docker build (custom) failed (exit code: {:?})",
+                status.code()
+            );
+        }
+    } else {
+        let status = std::process::Command::new("docker")
+            .args(["tag", "opencode-local-base", "opencode-local"])
+            .status()
+            .context("failed to tag base image as opencode-local")?;
+        if !status.success() {
+            anyhow::bail!(
+                "docker tag failed (exit code: {:?})",
+                status.code()
+            );
+        }
     }
+
     Ok(())
 }
