@@ -61,19 +61,32 @@ fn load_config() -> Result<Config> {
     Ok(config)
 }
 
-pub fn get_profile(name: &str) -> Result<Option<Profile>> {
-    let config = load_config()?;
-    Ok(config.profile.get(name).cloned())
-}
-
-pub fn get_default_features() -> Result<Vec<Feature>> {
-    let config = load_config()?;
-    Ok(config.default_features)
-}
-
 pub fn list_profiles() -> Result<Vec<String>> {
     let config = load_config()?;
     Ok(config.profile.into_keys().collect())
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ResolveOptions {
+    pub profile: Option<String>,
+    pub env: Vec<String>,
+    pub ports: Vec<u16>,
+    pub mounts: Vec<String>,
+    pub audio: Option<bool>,
+    pub dockerfile: Option<PathBuf>,
+    pub build_context: Option<PathBuf>,
+    pub features: Vec<Feature>,
+    pub no_default_features: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedConfig {
+    pub env_vars: HashMap<String, String>,
+    pub ports: Vec<u16>,
+    pub mounts: Vec<String>,
+    pub audio: bool,
+    pub features: Vec<Feature>,
+    pub dockerfile: Option<ResolvedDockerfile>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,24 +95,108 @@ pub struct ResolvedDockerfile {
     pub build_context: PathBuf,
 }
 
+pub fn resolve(opts: &ResolveOptions) -> Result<ResolvedConfig> {
+    let config = load_config()?;
+
+    let profile = opts
+        .profile
+        .as_deref()
+        .and_then(|name| config.profile.get(name).cloned());
+
+    let mut env_vars = profile
+        .as_ref()
+        .and_then(|p| p.env.clone())
+        .unwrap_or_default();
+    for e in &opts.env {
+        if let Some((k, v)) = e.split_once('=') {
+            env_vars.insert(k.to_string(), v.to_string());
+        }
+    }
+
+    let mut ports = profile
+        .as_ref()
+        .and_then(|p| p.ports.clone())
+        .unwrap_or_default();
+    ports.extend(&opts.ports);
+
+    let mut mounts = profile
+        .as_ref()
+        .and_then(|p| p.mounts.clone())
+        .unwrap_or_default();
+    mounts.extend(opts.mounts.iter().cloned());
+
+    let audio = opts
+        .audio
+        .or_else(|| profile.as_ref().and_then(|p| p.audio))
+        .unwrap_or(true);
+
+    let effective_default = if opts.no_default_features {
+        Vec::new()
+    } else {
+        config.default_features
+    };
+
+    let mut features = effective_default;
+    if let Some(pf) = profile.as_ref().and_then(|p| p.features.clone()) {
+        features.extend(pf);
+    }
+    features.extend(opts.features.iter().cloned());
+
+    let dockerfile = resolve_dockerfile(
+        opts.dockerfile.as_deref(),
+        opts.build_context.as_deref(),
+        profile.as_ref().and_then(|p| p.dockerfile.as_deref()),
+        profile.as_ref().and_then(|p| p.build_context.as_deref()),
+    )?;
+
+    Ok(ResolvedConfig {
+        env_vars,
+        ports,
+        mounts,
+        audio,
+        features,
+        dockerfile,
+    })
+}
+
+fn resolve_dockerfile(
+    cli_dockerfile: Option<&Path>,
+    cli_build_context: Option<&Path>,
+    profile_dockerfile: Option<&Path>,
+    profile_build_context: Option<&Path>,
+) -> Result<Option<ResolvedDockerfile>> {
+    if let Some(df) = cli_dockerfile {
+        let ctx = resolve_context_dir(cli_build_context, df)?;
+        Ok(Some(ResolvedDockerfile {
+            dockerfile: df.to_path_buf(),
+            build_context: ctx,
+        }))
+    } else if let Some(df) = profile_dockerfile {
+        let ctx = cli_build_context.or(profile_build_context);
+        Ok(Some(resolve_dockerfile_and_context(df, ctx)?))
+    } else {
+        Ok(None)
+    }
+}
+
 fn resolve_context_dir(
     build_context: Option<&Path>,
     dockerfile: &Path,
 ) -> Result<PathBuf> {
-    Ok(build_context.map_or_else(
-        || {
-            dockerfile
-                .parent()
-                .map(|p| p.to_path_buf())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "cannot determine build context: '{}' has no parent directory",
-                        dockerfile.display()
-                    )
-                })
-        },
-        |c| Ok(c.canonicalize().unwrap_or_else(|_| c.to_path_buf())),
-    )?)
+    match build_context {
+        Some(c) => c
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize build context '{}'", c.display())),
+        None => dockerfile
+            .parent()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot determine build context: '{}' has no parent directory",
+                    dockerfile.display()
+                )
+            }),
+    }
 }
 
 pub fn resolve_dockerfile_and_context(

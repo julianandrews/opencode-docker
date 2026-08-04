@@ -72,115 +72,57 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let profile = match cli.profile.as_deref() {
-        Some(name) => config::get_profile(name)
-            .with_context(|| format!("failed to load config for profile '{name}'"))?,
-        None => None,
-    };
-
-    let mut env_vars = profile
-        .as_ref()
-        .and_then(|p| p.env.clone())
-        .unwrap_or_default();
-    for e in &cli.env {
-        if let Some((k, v)) = e.split_once('=') {
-            env_vars.insert(k.to_string(), v.to_string());
-        }
-    }
-
-    let mut ports = profile
-        .as_ref()
-        .and_then(|p| p.ports.clone())
-        .unwrap_or_default();
-    ports.extend(cli.port);
-
-    let mut mounts = profile
-        .as_ref()
-        .and_then(|p| p.mounts.clone())
-        .unwrap_or_default();
-    mounts.extend(cli.mount);
-
-    let audio = cli
-        .audio
-        .or_else(|| profile.as_ref().and_then(|p| p.audio))
-        .unwrap_or(true);
-
-    let config_defaults =
-        config::get_default_features().context("failed to load default features")?;
-    let effective_default = if cli.no_default_features {
-        Vec::new()
-    } else {
-        config_defaults
-    };
-
-    let mut features = effective_default;
-    if let Some(pf) = profile.as_ref().and_then(|p| p.features.clone()) {
-        features.extend(pf);
-    }
-    features.extend(cli.feature);
-
-    let has_r = features.contains(&Feature::R);
-    let has_rust = features.contains(&Feature::Rust);
+    let cfg = config::resolve(&config::ResolveOptions {
+        profile: cli.profile,
+        env: cli.env,
+        ports: cli.port,
+        mounts: cli.mount,
+        audio: cli.audio,
+        dockerfile: cli.dockerfile,
+        build_context: cli.build_context,
+        features: cli.feature,
+        no_default_features: cli.no_default_features,
+    })?;
 
     check_cwd()?;
+    build_image(cfg.dockerfile.as_ref(), &cfg.features)?;
 
-    // Resolve dockerfile: CLI flag bypasses XDG search; profile dockerfile uses it
-    let cli_dockerfile = cli.dockerfile;
-    let cli_build_context = cli.build_context;
-    let profile_dockerfile = profile.as_ref().and_then(|p| p.dockerfile.clone());
-    let profile_build_context = profile.as_ref().and_then(|p| p.build_context.clone());
-
-    let resolved = if let Some(df) = cli_dockerfile {
-        let ctx = cli_build_context.unwrap_or_else(|| {
-            df.parent()
-                .expect("dockerfile has no parent directory")
-                .to_path_buf()
-        });
-        Some(config::ResolvedDockerfile {
-            dockerfile: df,
-            build_context: ctx,
-        })
-    } else if let Some(df) = profile_dockerfile {
-        let ctx = cli_build_context.or(profile_build_context);
-        Some(config::resolve_dockerfile_and_context(&df, ctx.as_deref())?)
-    } else {
-        None
-    };
-
-    build_image(resolved.as_ref(), has_r, has_rust)?;
-
-    if has_r {
+    if cfg.features.contains(&Feature::R) {
         r_setup::check_and_restore()?;
     }
 
+    run_container(&cfg, &cli.args)
+}
+
+fn run_container(cfg: &config::ResolvedConfig, extra_args: &[String]) -> Result<()> {
     let mut da = docker::DockerArgs::new();
     da.base()
-        .xdg_dirs()
-        .workspace()
+        .xdg_dirs()?
+        .workspace()?
         .security()
         .network()
-        .git_config()
-        .ports(&ports)
-        .extra_mounts(&mounts)?
-        .audio(audio)
-        .env_vars(&env_vars)
+        .git_config()?
+        .ports(&cfg.ports)
+        .extra_mounts(&cfg.mounts)?
+        .audio(cfg.audio)?
+        .env_vars(&cfg.env_vars)
         .hf_db_url();
 
-    if has_r {
-        da.r_library();
+    if cfg.features.contains(&Feature::R) {
+        da.r_library()?;
     }
-    if has_rust {
-        da.cargo_home();
+    if cfg.features.contains(&Feature::Rust) {
+        da.cargo_home()?;
     }
 
     let docker_args = da.into_vec();
 
     let mut opencode_args = vec!["--hostname".to_string(), "0.0.0.0".to_string()];
-    if let Some(&port) = ports.first() {
+    if let Some(&port) = cfg.ports.first() {
         opencode_args.push("--port".to_string());
         opencode_args.push(port.to_string());
     }
-    opencode_args.extend(cli.args);
+    opencode_args.extend(extra_args.iter().cloned());
 
     let status = std::process::Command::new("docker")
         .arg("run")
@@ -198,35 +140,40 @@ fn check_cwd() -> Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("cannot determine home directory"))?;
 
     if cwd == home {
-        eprintln!("\x1b[33mWarning: Current directory is your home directory ($HOME).\x1b[0m");
-        eprintln!("This would mount your entire home directory into the container.");
-        print!("Proceed anyway? [y/N] ");
-        std::io::Write::flush(&mut std::io::stdout())?;
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        if !input.trim().eq_ignore_ascii_case("y") {
-            std::process::exit(1);
-        }
+        confirm_or_exit(&[
+            "\x1b[33mWarning: Current directory is your home directory ($HOME).\x1b[0m".into(),
+            "This would mount your entire home directory into the container.".into(),
+        ])?;
     } else if !cwd.starts_with(&home) {
-        eprintln!("\x1b[33mWarning: Current directory is outside your home directory.\x1b[0m");
-        eprintln!("Mounting '{}' into the container.", cwd.display());
-        print!("Proceed anyway? [y/N] ");
-        std::io::Write::flush(&mut std::io::stdout())?;
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        if !input.trim().eq_ignore_ascii_case("y") {
-            std::process::exit(1);
-        }
+        confirm_or_exit(&[
+            "\x1b[33mWarning: Current directory is outside your home directory.\x1b[0m".into(),
+            format!("Mounting '{}' into the container.", cwd.display()),
+        ])?;
     }
 
     Ok(())
 }
 
+fn confirm_or_exit(lines: &[String]) -> Result<()> {
+    for line in lines {
+        eprintln!("{}", line);
+    }
+    print!("Proceed anyway? [y/N] ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    if !input.trim().eq_ignore_ascii_case("y") {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 fn build_image(
     resolved: Option<&config::ResolvedDockerfile>,
-    has_r: bool,
-    has_rust: bool,
+    features: &[Feature],
 ) -> Result<()> {
+    let has_r = features.contains(&Feature::R);
+    let has_rust = features.contains(&Feature::Rust);
     let status = {
         let tmp = tempfile::tempdir()?;
         let df = tmp.path().join("Dockerfile");

@@ -1,11 +1,13 @@
-use nix::unistd::{Gid, Uid};
-
 pub fn uid() -> String {
-    Uid::current().to_string()
+    // SAFETY: getuid is a simple syscall with no safety requirements
+    // (no pointer arguments, no preconditions, always succeeds).
+    unsafe { libc::getuid() }.to_string()
 }
 
 pub fn gid() -> String {
-    Gid::current().to_string()
+    // SAFETY: getgid is a simple syscall with no safety requirements
+    // (no pointer arguments, no preconditions, always succeeds).
+    unsafe { libc::getgid() }.to_string()
 }
 
 #[cfg(test)]

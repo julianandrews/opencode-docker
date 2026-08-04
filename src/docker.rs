@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -42,14 +42,17 @@ impl DockerArgs {
         self
     }
 
-    pub fn xdg_dirs(&mut self) -> &mut Self {
-        let config = dirs::config_dir().expect("config dir required");
-        let cache = dirs::cache_dir().expect("cache dir required");
-        let data = dirs::data_dir().expect("data dir required");
-        let state = dirs::state_dir().unwrap_or_else(|| {
-            let home = dirs::home_dir().expect("home dir required");
-            home.join(".local/state")
-        });
+    pub fn xdg_dirs(&mut self) -> Result<&mut Self> {
+        let config = dirs::config_dir().context("config dir required")?;
+        let cache = dirs::cache_dir().context("cache dir required")?;
+        let data = dirs::data_dir().context("data dir required")?;
+        let state = match dirs::state_dir() {
+            Some(s) => s,
+            None => {
+                let home = dirs::home_dir().context("home dir required")?;
+                home.join(".local/state")
+            }
+        };
 
         let dirs_to_create = [
             cache.join("opencode"),
@@ -82,21 +85,21 @@ impl DockerArgs {
         self.args.push(format!("{}:/opencode/data/opentui", data.join("opentui").display()));
         self.args.push("-v".into());
         self.args.push(format!("{}:/opencode/state/opencode", state.join("opencode").display()));
-        self
+        Ok(self)
     }
 
-    pub fn cargo_home(&mut self) -> &mut Self {
-        let data = dirs::data_dir().expect("data dir required");
+    pub fn cargo_home(&mut self) -> Result<&mut Self> {
+        let data = dirs::data_dir().context("data dir required")?;
         let _ = std::fs::create_dir_all(data.join("cargo"));
         self.args.push("-e".into());
         self.args.push("CARGO_HOME=/opencode/cargo".into());
         self.args.push("-v".into());
         self.args.push(format!("{}:/opencode/cargo", data.join("cargo").display()));
-        self
+        Ok(self)
     }
 
-    pub fn workspace(&mut self) -> &mut Self {
-        let cwd = std::env::current_dir().expect("current dir");
+    pub fn workspace(&mut self) -> Result<&mut Self> {
+        let cwd = std::env::current_dir().context("failed to get current directory")?;
         let basename = cwd.file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "root".to_string());
@@ -105,7 +108,7 @@ impl DockerArgs {
         self.args.push(format!("{}:/workspace/{}", cwd.display(), basename));
         self.args.push("-w".into());
         self.args.push(format!("/workspace/{}", basename));
-        self
+        Ok(self)
     }
 
     pub fn security(&mut self) -> &mut Self {
@@ -126,8 +129,8 @@ impl DockerArgs {
         self
     }
 
-    pub fn r_library(&mut self) -> &mut Self {
-        let data = dirs::data_dir().expect("data dir required");
+    pub fn r_library(&mut self) -> Result<&mut Self> {
+        let data = dirs::data_dir().context("data dir required")?;
         let r_lib = data.join("opencode-docker/r-library");
 
         self.args.push("-e".into());
@@ -136,17 +139,17 @@ impl DockerArgs {
         self.args.push("RENV_PATHS_ROOT=/tmp/renv".into());
         self.args.push("-v".into());
         self.args.push(format!("{}:/opt/r-library", r_lib.display()));
-        self
+        Ok(self)
     }
 
-    pub fn git_config(&mut self) -> &mut Self {
-        let home = dirs::home_dir().expect("home directory required");
+    pub fn git_config(&mut self) -> Result<&mut Self> {
+        let home = dirs::home_dir().context("home directory required")?;
         let git_config = home.join(".config/git");
         if git_config.is_dir() {
             self.args.push("-v".into());
             self.args.push(format!("{}:/opencode/config/git:ro", git_config.display()));
         }
-        self
+        Ok(self)
     }
 
     pub fn ports(&mut self, ports: &[u16]) -> &mut Self {
@@ -164,7 +167,7 @@ impl DockerArgs {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "root".to_string());
 
-        let mut seen_targets = vec![cwd_basename];
+        let mut seen_targets = HashSet::from([cwd_basename]);
 
         for mount_spec in mounts {
             let (host_path, target_name) = if let Some(idx) = mount_spec.find(':') {
@@ -184,10 +187,9 @@ impl DockerArgs {
                     .expect("mount path has no filename")
             });
 
-            if seen_targets.contains(&target) {
+            if !seen_targets.insert(target.clone()) {
                 anyhow::bail!("duplicate mount target '/workspace/{}'", target);
             }
-            seen_targets.push(target.clone());
 
             self.args.push("-v".into());
             self.args.push(format!("{}:/workspace/{}", resolved.display(), target));
@@ -195,9 +197,9 @@ impl DockerArgs {
         Ok(self)
     }
 
-    pub fn audio(&mut self, enabled: bool) -> &mut Self {
+    pub fn audio(&mut self, enabled: bool) -> Result<&mut Self> {
         if !enabled {
-            return self;
+            return Ok(self);
         }
         let runtime_dir = Path::new("/run/user").join(util::uid());
         let pulse_socket = runtime_dir.join("pulse/native");
@@ -206,16 +208,16 @@ impl DockerArgs {
                 "Warning: PulseAudio socket not found at {}; skipping audio setup",
                 pulse_socket.display()
             );
-            return self;
+            return Ok(self);
         }
 
-        let pulse_dir = pulse_socket.parent().expect("pulse socket has parent");
+        let pulse_dir = pulse_socket.parent().context("pulse socket has no parent")?;
         self.args.push("-e".into());
         self.args.push(format!("PULSE_SERVER=unix:{}", pulse_socket.display()));
         self.args.push("-v".into());
         self.args.push(format!("{}:{}:ro", pulse_dir.display(), pulse_dir.display()));
 
-        let home = dirs::home_dir().expect("home directory required");
+        let home = dirs::home_dir().context("home directory required")?;
         let cookie = home.join(".config/pulse/cookie");
         if cookie.exists() {
             self.args.push("-e".into());
@@ -223,7 +225,7 @@ impl DockerArgs {
             self.args.push("-v".into());
             self.args.push(format!("{}:/opencode/pulse-cookie:rw", cookie.display()));
         }
-        self
+        Ok(self)
     }
 
     pub fn env_vars(&mut self, vars: &HashMap<String, String>) -> &mut Self {

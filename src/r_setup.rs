@@ -35,7 +35,9 @@ pub fn check_and_restore() -> Result<()> {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "root".to_string());
 
-    let r_script = include_str!("../docker/r-setup.R");
+    let tmp = tempfile::tempdir()?;
+    let r_script_path = tmp.path().join("r-setup.R");
+    std::fs::write(&r_script_path, include_str!("../docker/r-setup.R"))?;
 
     let mut cmd = std::process::Command::new("docker");
     cmd.args([
@@ -53,6 +55,8 @@ pub fn check_and_restore() -> Result<()> {
         &format!("{}:/opt/r-library", r_lib_cache.display()),
         "-v",
         &format!("{}:/workspace/{}", cwd.display(), cwd_basename),
+        "-v",
+        &format!("{}:/setup.R:ro", r_script_path.display()),
         "-w",
         &format!("/workspace/{}", cwd_basename),
         "--tmpfs",
@@ -61,8 +65,8 @@ pub fn check_and_restore() -> Result<()> {
         "--entrypoint",
         "R",
         "opencode-local",
-        "-e",
-        r_script,
+        "-f",
+        "/setup.R",
     ]);
 
     if let Ok(url) = std::env::var("HF_DB_URL") {
