@@ -153,8 +153,10 @@ pub struct ResolvedConfig {
 }
 
 pub fn resolve(opts: &ResolveOptions) -> Result<ResolvedConfig> {
-    let config = load_config()?;
+    Ok(resolve_from(&load_config()?, opts))
+}
 
+pub(crate) fn resolve_from(config: &Config, opts: &ResolveOptions) -> ResolvedConfig {
     let profile = opts
         .profile
         .as_deref()
@@ -187,27 +189,25 @@ pub fn resolve(opts: &ResolveOptions) -> Result<ResolvedConfig> {
         .or_else(|| profile.as_ref().and_then(|p| p.audio))
         .unwrap_or(true);
 
-    let effective_default = if opts.no_default_features {
+    let features: Vec<Feature> = if !opts.features.is_empty() {
+        opts.features.clone()
+    } else if let Some(pf) = profile.as_ref().and_then(|p| p.features.clone()) {
+        pf
+    } else if opts.no_default_features {
         Vec::new()
     } else {
         config.default_features.clone()
     };
 
-    let mut features = effective_default;
-    if let Some(pf) = profile.as_ref().and_then(|p| p.features.clone()) {
-        features.extend(pf);
-    }
-    features.extend(opts.features.iter().cloned());
-
-    Ok(ResolvedConfig {
+    ResolvedConfig {
         env_vars,
         ports,
         mounts,
         audio,
         features,
-        build: config.build,
-        default_features: config.default_features,
-    })
+        build: config.build.clone(),
+        default_features: config.default_features.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -426,5 +426,116 @@ default_feature = ["R"]
 "#;
         let err = toml::from_str::<Config>(toml_str).unwrap_err();
         assert!(err.to_string().contains("default_feature"));
+    }
+
+    fn run_resolve(
+        toml_str: &str,
+        profile: Option<&str>,
+        cli_features: Vec<Feature>,
+        no_default: bool,
+    ) -> Vec<Feature> {
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let opts = ResolveOptions {
+            profile: profile.map(String::from),
+            env: Vec::new(),
+            ports: Vec::new(),
+            mounts: Vec::new(),
+            audio: None,
+            features: cli_features,
+            no_default_features: no_default,
+        };
+        resolve_from(&config, &opts).features
+    }
+
+    #[test]
+    fn resolve_profile_features_override_defaults() {
+        let toml_str = r#"
+default_features = ["Rust"]
+[profile.harvestflow]
+features = ["R"]
+"#;
+        assert_eq!(
+            run_resolve(toml_str, Some("harvestflow"), vec![], false),
+            vec![Feature::R]
+        );
+    }
+
+    #[test]
+    fn resolve_cli_features_override_defaults() {
+        let toml_str = r#"default_features = ["Rust"]"#;
+        assert_eq!(
+            run_resolve(toml_str, None, vec![Feature::R], false),
+            vec![Feature::R]
+        );
+    }
+
+    #[test]
+    fn resolve_cli_features_override_profile() {
+        let toml_str = r#"
+default_features = ["Rust"]
+[profile.harvestflow]
+features = ["R"]
+"#;
+        assert_eq!(
+            run_resolve(toml_str, Some("harvestflow"), vec![Feature::Rust], false),
+            vec![Feature::Rust]
+        );
+    }
+
+    #[test]
+    fn resolve_profile_without_features_keeps_defaults() {
+        let toml_str = r#"
+default_features = ["Rust"]
+[profile.plain]
+env = { FOO = "bar" }
+"#;
+        assert_eq!(
+            run_resolve(toml_str, Some("plain"), vec![], false),
+            vec![Feature::Rust]
+        );
+    }
+
+    #[test]
+    fn resolve_no_default_features_is_empty() {
+        let toml_str = r#"default_features = ["Rust"]"#;
+        assert_eq!(
+            run_resolve(toml_str, None, vec![], true),
+            Vec::<Feature>::new()
+        );
+    }
+
+    #[test]
+    fn resolve_no_default_features_profile_features_apply() {
+        let toml_str = r#"
+default_features = ["Rust"]
+[profile.harvestflow]
+features = ["R"]
+"#;
+        assert_eq!(
+            run_resolve(toml_str, Some("harvestflow"), vec![], true),
+            vec![Feature::R]
+        );
+    }
+
+    #[test]
+    fn resolve_no_default_features_cli_features_apply() {
+        let toml_str = r#"default_features = ["Rust"]"#;
+        assert_eq!(
+            run_resolve(toml_str, None, vec![Feature::R], true),
+            vec![Feature::R]
+        );
+    }
+
+    #[test]
+    fn resolve_profile_empty_features_override_defaults() {
+        let toml_str = r#"
+default_features = ["Rust"]
+[profile.plain]
+features = []
+"#;
+        assert_eq!(
+            run_resolve(toml_str, Some("plain"), vec![], false),
+            Vec::<Feature>::new()
+        );
     }
 }

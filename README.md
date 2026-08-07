@@ -49,6 +49,9 @@ ports = [8080]
 
 Image names are canonical: features are deduplicated, sorted (R before Rust), and lowercased, so
 `opencode-local-r-rust` is the same whether the features came from the CLI, a profile, or `default_features`.
+Feature precedence is "most specific wins": a profile's `features` replace `default_features`, and
+`--feature` on the command line replaces both. `--no-default-features` drops `default_features` (a profile
+or `--feature` still applies on top).
 
 Profile `env` entries (overridable with `--env K=V`) are passed to the container; they are also forwarded to the
 R dependency-setup container, so anything your R scripts need (e.g. `HF_DB_URL`) goes in the profile. The host
