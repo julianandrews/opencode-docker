@@ -35,4 +35,3 @@ RUN apk add --no-cache bash curl jq git ffmpeg build-base protobuf tzdata \
 ENV PATH=/usr/local/cargo/bin:$PATH \
     RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo
-ENV RENV_PATHS_ROOT=/tmp/renv

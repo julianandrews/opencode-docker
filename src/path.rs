@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 pub fn resolve_path(s: &str) -> Result<PathBuf> {
-    let expanded = shellexpand::full(s)
-        .with_context(|| format!("failed to expand path '{}'", s))?;
+    let expanded =
+        shellexpand::full(s).with_context(|| format!("failed to expand path '{}'", s))?;
     std::fs::canonicalize(expanded.as_ref())
         .with_context(|| format!("cannot resolve path '{}'", expanded))
 }

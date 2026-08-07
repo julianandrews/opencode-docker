@@ -4,6 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::path;
+use crate::r;
 use crate::util;
 
 #[derive(Debug)]
@@ -67,24 +68,35 @@ impl DockerArgs {
             let _ = std::fs::create_dir_all(dir);
         }
 
-        self.args.push("-e".into());
-        self.args.push("XDG_CONFIG_HOME=/opencode/config".into());
-        self.args.push("-e".into());
-        self.args.push("XDG_CACHE_HOME=/opencode/cache".into());
-        self.args.push("-e".into());
-        self.args.push("XDG_DATA_HOME=/opencode/data".into());
-        self.args.push("-e".into());
-        self.args.push("XDG_STATE_HOME=/opencode/state".into());
+        for (name, value) in r::XDG_ENV {
+            self.args.push("-e".into());
+            self.args.push(format!("{}={}", name, value));
+        }
         self.args.push("-v".into());
-        self.args.push(format!("{}:/opencode/config/opencode:ro", config.join("opencode").display()));
+        self.args.push(format!(
+            "{}:/opencode/config/opencode:ro",
+            config.join("opencode").display()
+        ));
         self.args.push("-v".into());
-        self.args.push(format!("{}:/opencode/cache/opencode", cache.join("opencode").display()));
+        self.args.push(format!(
+            "{}:/opencode/cache/opencode",
+            cache.join("opencode").display()
+        ));
         self.args.push("-v".into());
-        self.args.push(format!("{}:/opencode/data/opencode", data.join("opencode").display()));
+        self.args.push(format!(
+            "{}:/opencode/data/opencode",
+            data.join("opencode").display()
+        ));
         self.args.push("-v".into());
-        self.args.push(format!("{}:/opencode/data/opentui", data.join("opentui").display()));
+        self.args.push(format!(
+            "{}:/opencode/data/opentui",
+            data.join("opentui").display()
+        ));
         self.args.push("-v".into());
-        self.args.push(format!("{}:/opencode/state/opencode", state.join("opencode").display()));
+        self.args.push(format!(
+            "{}:/opencode/state/opencode",
+            state.join("opencode").display()
+        ));
         Ok(self)
     }
 
@@ -94,18 +106,21 @@ impl DockerArgs {
         self.args.push("-e".into());
         self.args.push("CARGO_HOME=/opencode/cargo".into());
         self.args.push("-v".into());
-        self.args.push(format!("{}:/opencode/cargo", data.join("cargo").display()));
+        self.args
+            .push(format!("{}:/opencode/cargo", data.join("cargo").display()));
         Ok(self)
     }
 
     pub fn workspace(&mut self) -> Result<&mut Self> {
         let cwd = std::env::current_dir().context("failed to get current directory")?;
-        let basename = cwd.file_name()
+        let basename = cwd
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "root".to_string());
 
         self.args.push("-v".into());
-        self.args.push(format!("{}:/workspace/{}", cwd.display(), basename));
+        self.args
+            .push(format!("{}:/workspace/{}", cwd.display(), basename));
         self.args.push("-w".into());
         self.args.push(format!("/workspace/{}", basename));
         Ok(self)
@@ -134,11 +149,20 @@ impl DockerArgs {
         let r_lib = data.join("opencode-docker/r-library");
 
         self.args.push("-e".into());
-        self.args.push("R_LIBS_SITE=/opt/r-library".into());
-        self.args.push("-e".into());
-        self.args.push("RENV_PATHS_ROOT=/tmp/renv".into());
+        self.args.push(format!("R_LIBS_SITE={}", r::R_LIB_SITE));
         self.args.push("-v".into());
-        self.args.push(format!("{}:/opt/r-library", r_lib.display()));
+        self.args
+            .push(format!("{}:{}", r_lib.display(), r::R_LIB_SITE));
+        Ok(self)
+    }
+
+    /// Mount the host R XDG dirs so `tools::R_user_dir()` paths (e.g. renv's
+    /// project library, sass's cache) are writable and persist across runs.
+    pub fn r_user_dirs(&mut self) -> Result<&mut Self> {
+        for (host, target) in r::r_user_dir_mounts()? {
+            self.args.push("-v".into());
+            self.args.push(format!("{}:{}", host.display(), target));
+        }
         Ok(self)
     }
 
@@ -147,7 +171,8 @@ impl DockerArgs {
         let git_config = home.join(".config/git");
         if git_config.is_dir() {
             self.args.push("-v".into());
-            self.args.push(format!("{}:/opencode/config/git:ro", git_config.display()));
+            self.args
+                .push(format!("{}:/opencode/config/git:ro", git_config.display()));
         }
         Ok(self)
     }
@@ -161,9 +186,10 @@ impl DockerArgs {
     }
 
     pub fn extra_mounts(&mut self, mounts: &[String]) -> Result<&mut Self> {
-        let cwd = std::env::current_dir()
-            .context("failed to get current directory for extra mounts")?;
-        let cwd_basename = cwd.file_name()
+        let cwd =
+            std::env::current_dir().context("failed to get current directory for extra mounts")?;
+        let cwd_basename = cwd
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "root".to_string());
 
@@ -182,7 +208,8 @@ impl DockerArgs {
                 .with_context(|| format!("failed to resolve mount path '{}'", host_path))?;
 
             let target = target_name.unwrap_or_else(|| {
-                resolved.file_name()
+                resolved
+                    .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .expect("mount path has no filename")
             });
@@ -192,7 +219,8 @@ impl DockerArgs {
             }
 
             self.args.push("-v".into());
-            self.args.push(format!("{}:/workspace/{}", resolved.display(), target));
+            self.args
+                .push(format!("{}:/workspace/{}", resolved.display(), target));
         }
         Ok(self)
     }
@@ -211,11 +239,18 @@ impl DockerArgs {
             return Ok(self);
         }
 
-        let pulse_dir = pulse_socket.parent().context("pulse socket has no parent")?;
+        let pulse_dir = pulse_socket
+            .parent()
+            .context("pulse socket has no parent")?;
         self.args.push("-e".into());
-        self.args.push(format!("PULSE_SERVER=unix:{}", pulse_socket.display()));
+        self.args
+            .push(format!("PULSE_SERVER=unix:{}", pulse_socket.display()));
         self.args.push("-v".into());
-        self.args.push(format!("{}:{}:ro", pulse_dir.display(), pulse_dir.display()));
+        self.args.push(format!(
+            "{}:{}:ro",
+            pulse_dir.display(),
+            pulse_dir.display()
+        ));
 
         let home = dirs::home_dir().context("home directory required")?;
         let cookie = home.join(".config/pulse/cookie");
@@ -223,7 +258,8 @@ impl DockerArgs {
             self.args.push("-e".into());
             self.args.push("PULSE_COOKIE=/opencode/pulse-cookie".into());
             self.args.push("-v".into());
-            self.args.push(format!("{}:/opencode/pulse-cookie:rw", cookie.display()));
+            self.args
+                .push(format!("{}:/opencode/pulse-cookie:rw", cookie.display()));
         }
         Ok(self)
     }
@@ -232,14 +268,6 @@ impl DockerArgs {
         for (k, v) in vars {
             self.args.push("-e".into());
             self.args.push(format!("{}={}", k, v));
-        }
-        self
-    }
-
-    pub fn hf_db_url(&mut self) -> &mut Self {
-        if let Ok(url) = std::env::var("HF_DB_URL") {
-            self.args.push("-e".into());
-            self.args.push(format!("HF_DB_URL={}", url));
         }
         self
     }
@@ -263,11 +291,17 @@ mod tests {
         vars.insert("KEY".to_string(), "val".to_string());
         da.env_vars(&vars);
         let args = da.into_vec();
-        assert_eq!(args, &[
-            "-p", "127.0.0.1:3000:3000",
-            "-p", "127.0.0.1:4000:4000",
-            "-e", "KEY=val",
-        ]);
+        assert_eq!(
+            args,
+            &[
+                "-p",
+                "127.0.0.1:3000:3000",
+                "-p",
+                "127.0.0.1:4000:4000",
+                "-e",
+                "KEY=val",
+            ]
+        );
     }
 
     #[test]

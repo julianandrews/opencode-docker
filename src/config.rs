@@ -2,14 +2,22 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum Feature {
     R,
     Rust,
+}
+
+impl std::fmt::Display for Feature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Feature::R => write!(f, "R"),
+            Feature::Rust => write!(f, "Rust"),
+        }
+    }
 }
 
 impl FromStr for Feature {
@@ -24,21 +32,33 @@ impl FromStr for Feature {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub default_features: Vec<Feature>,
     #[serde(default)]
     pub profile: HashMap<String, Profile>,
+    #[serde(default)]
+    pub build: BuildConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BuildConfig {
+    /// Feature combinations to pre-build (e.g. via the systemd timer).
+    /// Each entry is one image variant. If unset, defaults to `[[], default_features]`
+    /// (or `[[]]` when no default features are configured).
+    #[serde(default)]
+    pub variants: Vec<Vec<Feature>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Profile {
     pub env: Option<HashMap<String, String>>,
     pub mounts: Option<Vec<String>>,
     pub ports: Option<Vec<u16>>,
     pub audio: Option<bool>,
-    pub dockerfile: Option<PathBuf>,
-    pub build_context: Option<PathBuf>,
     pub features: Option<Vec<Feature>>,
 }
 
@@ -46,7 +66,7 @@ fn config_path() -> Option<std::path::PathBuf> {
     Some(dirs::config_dir()?.join("opencode-docker/docker-profiles.toml"))
 }
 
-fn load_config() -> Result<Config> {
+pub fn load_config() -> Result<Config> {
     let path = match config_path() {
         Some(p) => p,
         None => return Ok(Config::default()),
@@ -66,6 +86,50 @@ pub fn list_profiles() -> Result<Vec<String>> {
     Ok(config.profile.into_keys().collect())
 }
 
+/// Canonical feature suffix: dedup, sort in declaration order, lowercase,
+/// joined with '-'. Empty for the no-feature variant.
+fn feature_suffix(features: &[Feature]) -> String {
+    let mut set: Vec<Feature> = features.to_vec();
+    set.sort();
+    set.dedup();
+    if set.is_empty() {
+        return String::new();
+    }
+    set.iter()
+        .map(|f| format!("-{}", f.to_string().to_ascii_lowercase()))
+        .collect()
+}
+
+/// Final image name for a feature set, e.g. "opencode-local-r-rust".
+pub fn image_name_for(features: &[Feature]) -> String {
+    format!("opencode-local{}", feature_suffix(features))
+}
+
+/// Image variants to pre-build: the configured `[build]` variants if set, otherwise the
+/// no-feature image plus one per `default_features` combination, or `[[]]` if neither is set.
+pub fn default_variants(build: &BuildConfig, default_features: &[Feature]) -> Vec<Vec<Feature>> {
+    if !build.variants.is_empty() {
+        return build.variants.clone();
+    }
+    if default_features.is_empty() {
+        return vec![vec![]];
+    }
+    vec![vec![], default_features.to_vec()]
+}
+
+/// Whether a feature set is a pre-built variant (matched by canonical image name,
+/// so ordering or duplicates in the config don't matter).
+pub fn variants_contain(
+    build: &BuildConfig,
+    default_features: &[Feature],
+    features: &[Feature],
+) -> bool {
+    let image = image_name_for(features);
+    default_variants(build, default_features)
+        .iter()
+        .any(|v| image_name_for(v) == image)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ResolveOptions {
     pub profile: Option<String>,
@@ -73,8 +137,6 @@ pub struct ResolveOptions {
     pub ports: Vec<u16>,
     pub mounts: Vec<String>,
     pub audio: Option<bool>,
-    pub dockerfile: Option<PathBuf>,
-    pub build_context: Option<PathBuf>,
     pub features: Vec<Feature>,
     pub no_default_features: bool,
 }
@@ -86,13 +148,8 @@ pub struct ResolvedConfig {
     pub mounts: Vec<String>,
     pub audio: bool,
     pub features: Vec<Feature>,
-    pub dockerfile: Option<ResolvedDockerfile>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ResolvedDockerfile {
-    pub dockerfile: PathBuf,
-    pub build_context: PathBuf,
+    pub build: BuildConfig,
+    pub default_features: Vec<Feature>,
 }
 
 pub fn resolve(opts: &ResolveOptions) -> Result<ResolvedConfig> {
@@ -133,7 +190,7 @@ pub fn resolve(opts: &ResolveOptions) -> Result<ResolvedConfig> {
     let effective_default = if opts.no_default_features {
         Vec::new()
     } else {
-        config.default_features
+        config.default_features.clone()
     };
 
     let mut features = effective_default;
@@ -142,105 +199,15 @@ pub fn resolve(opts: &ResolveOptions) -> Result<ResolvedConfig> {
     }
     features.extend(opts.features.iter().cloned());
 
-    let dockerfile = resolve_dockerfile(
-        opts.dockerfile.as_deref(),
-        opts.build_context.as_deref(),
-        profile.as_ref().and_then(|p| p.dockerfile.as_deref()),
-        profile.as_ref().and_then(|p| p.build_context.as_deref()),
-    )?;
-
     Ok(ResolvedConfig {
         env_vars,
         ports,
         mounts,
         audio,
         features,
-        dockerfile,
+        build: config.build,
+        default_features: config.default_features,
     })
-}
-
-fn resolve_dockerfile(
-    cli_dockerfile: Option<&Path>,
-    cli_build_context: Option<&Path>,
-    profile_dockerfile: Option<&Path>,
-    profile_build_context: Option<&Path>,
-) -> Result<Option<ResolvedDockerfile>> {
-    if let Some(df) = cli_dockerfile {
-        let ctx = resolve_context_dir(cli_build_context, df)?;
-        Ok(Some(ResolvedDockerfile {
-            dockerfile: df.to_path_buf(),
-            build_context: ctx,
-        }))
-    } else if let Some(df) = profile_dockerfile {
-        let ctx = cli_build_context.or(profile_build_context);
-        Ok(Some(resolve_dockerfile_and_context(df, ctx)?))
-    } else {
-        Ok(None)
-    }
-}
-
-fn resolve_context_dir(
-    build_context: Option<&Path>,
-    dockerfile: &Path,
-) -> Result<PathBuf> {
-    match build_context {
-        Some(c) => c
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize build context '{}'", c.display())),
-        None => dockerfile
-            .parent()
-            .map(|p| p.to_path_buf())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "cannot determine build context: '{}' has no parent directory",
-                    dockerfile.display()
-                )
-            }),
-    }
-}
-
-pub fn resolve_dockerfile_and_context(
-    dockerfile: &Path,
-    build_context: Option<&Path>,
-) -> Result<ResolvedDockerfile> {
-    if dockerfile.is_absolute() {
-        return Ok(ResolvedDockerfile {
-            dockerfile: dockerfile.to_path_buf(),
-            build_context: resolve_context_dir(build_context, dockerfile)?,
-        });
-    }
-
-    if dockerfile.exists() {
-        let abs = dockerfile.canonicalize()?;
-        return Ok(ResolvedDockerfile {
-            dockerfile: abs.clone(),
-            build_context: resolve_context_dir(build_context, &abs)?,
-        });
-    }
-
-    let data_dir = dirs::data_dir()
-        .ok_or_else(|| anyhow::anyhow!("cannot determine data directory"))?;
-    let dockerfiles_dir = data_dir.join("opencode-docker/dockerfiles");
-
-    let candidates = [
-        dockerfiles_dir.join(dockerfile).join("Dockerfile"),
-        dockerfiles_dir.join(format!("{}.dockerfile", dockerfile.display())),
-    ];
-
-    for candidate in &candidates {
-        if candidate.exists() {
-            return Ok(ResolvedDockerfile {
-                dockerfile: candidate.clone(),
-                build_context: resolve_context_dir(build_context, &candidate)?,
-            });
-        }
-    }
-
-    anyhow::bail!(
-        "dockerfile '{}' not found (searched: {:?})",
-        dockerfile.display(),
-        candidates
-    )
 }
 
 #[cfg(test)]
@@ -259,13 +226,10 @@ mod tests {
     #[test]
     fn feature_deserialize() {
         use serde::de::value::StrDeserializer;
-        let r = Feature::deserialize(
-            StrDeserializer::<serde::de::value::Error>::new("R"),
-        ).unwrap();
+        let r = Feature::deserialize(StrDeserializer::<serde::de::value::Error>::new("R")).unwrap();
         assert_eq!(r, Feature::R);
-        let rust = Feature::deserialize(
-            StrDeserializer::<serde::de::value::Error>::new("Rust"),
-        ).unwrap();
+        let rust =
+            Feature::deserialize(StrDeserializer::<serde::de::value::Error>::new("Rust")).unwrap();
         assert_eq!(rust, Feature::Rust);
     }
 
@@ -274,6 +238,139 @@ mod tests {
         let config: Config = toml::from_str("").unwrap();
         assert!(config.profile.is_empty());
         assert!(config.default_features.is_empty());
+        assert!(config.build.variants.is_empty());
+    }
+
+    #[test]
+    fn config_with_build_variants() {
+        let toml_str = r#"
+[build]
+variants = [["R"], ["Rust"], ["R", "Rust"]]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.build.variants,
+            vec![
+                vec![Feature::R],
+                vec![Feature::Rust],
+                vec![Feature::R, Feature::Rust],
+            ]
+        );
+    }
+
+    #[test]
+    fn image_name_for_none() {
+        assert_eq!(image_name_for(&[]), "opencode-local");
+    }
+
+    #[test]
+    fn image_name_for_single() {
+        assert_eq!(image_name_for(&[Feature::Rust]), "opencode-local-rust");
+    }
+
+    #[test]
+    fn image_name_for_order_independent() {
+        assert_eq!(
+            image_name_for(&[Feature::R, Feature::Rust]),
+            image_name_for(&[Feature::Rust, Feature::R]),
+        );
+        assert_eq!(
+            image_name_for(&[Feature::R, Feature::Rust]),
+            "opencode-local-r-rust"
+        );
+    }
+
+    #[test]
+    fn image_name_for_dedup() {
+        assert_eq!(
+            image_name_for(&[Feature::R, Feature::Rust, Feature::R]),
+            "opencode-local-r-rust",
+        );
+    }
+
+    #[test]
+    fn default_variants_configured_wins() {
+        let config: Config = toml::from_str(
+            r#"
+default_features = ["R", "Rust"]
+[build]
+variants = [["R"]]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            default_variants(&config.build, &config.default_features),
+            vec![vec![Feature::R]]
+        );
+    }
+
+    #[test]
+    fn default_variants_derived_from_default_features() {
+        let config: Config = toml::from_str(r#"default_features = ["R", "Rust"]"#).unwrap();
+        assert_eq!(
+            default_variants(&config.build, &config.default_features),
+            vec![vec![], vec![Feature::R, Feature::Rust]]
+        );
+    }
+
+    #[test]
+    fn default_variants_empty_falls_back_to_no_features() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            default_variants(&config.build, &config.default_features),
+            vec![vec![]]
+        );
+    }
+
+    #[test]
+    fn variants_contain_matches_by_canonical_name() {
+        let config: Config = toml::from_str(
+            r#"
+[build]
+variants = [["Rust", "R"]]
+"#,
+        )
+        .unwrap();
+        assert!(variants_contain(
+            &config.build,
+            &config.default_features,
+            &[Feature::R, Feature::Rust]
+        ));
+        assert!(variants_contain(
+            &config.build,
+            &config.default_features,
+            &[Feature::Rust, Feature::R, Feature::R]
+        ));
+        assert!(!variants_contain(
+            &config.build,
+            &config.default_features,
+            &[Feature::R]
+        ));
+        assert!(!variants_contain(
+            &config.build,
+            &config.default_features,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn variants_contain_default_feature_derived() {
+        let config: Config = toml::from_str(r#"default_features = ["R", "Rust"]"#).unwrap();
+        assert!(variants_contain(
+            &config.build,
+            &config.default_features,
+            &[Feature::R, Feature::Rust]
+        ));
+        assert!(variants_contain(
+            &config.build,
+            &config.default_features,
+            &[]
+        ));
+        assert!(!variants_contain(
+            &config.build,
+            &config.default_features,
+            &[Feature::R]
+        ));
     }
 
     #[test]
@@ -299,5 +396,35 @@ mounts = ["~/data"]
         assert_eq!(myenv.ports.as_ref().unwrap(), &[8080, 9090]);
         assert_eq!(myenv.audio, Some(false));
         assert_eq!(myenv.features.as_ref().unwrap(), &[Feature::R]);
+    }
+
+    #[test]
+    fn config_rejects_unknown_profile_field() {
+        let toml_str = r#"
+[profile.intake]
+dockerfile = "intake"
+build_context = "/home/julian/Code/intake"
+"#;
+        let err = toml::from_str::<Config>(toml_str).unwrap_err();
+        assert!(err.to_string().contains("dockerfile"));
+    }
+
+    #[test]
+    fn config_rejects_unknown_build_field() {
+        let toml_str = r#"
+[build]
+variance = [["R"]]
+"#;
+        let err = toml::from_str::<Config>(toml_str).unwrap_err();
+        assert!(err.to_string().contains("variance"));
+    }
+
+    #[test]
+    fn config_rejects_unknown_top_level_field() {
+        let toml_str = r#"
+default_feature = ["R"]
+"#;
+        let err = toml::from_str::<Config>(toml_str).unwrap_err();
+        assert!(err.to_string().contains("default_feature"));
     }
 }
