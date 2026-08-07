@@ -56,8 +56,14 @@ or `--feature` still applies on top).
 Profile `env` entries (overridable with `--env K=V`) are passed to the container; they are also forwarded to the
 R dependency-setup container, so anything your R scripts need (e.g. `HF_DB_URL`) goes in the profile. The host
 environment is not forwarded. `R_REPOSITORIES` is available in the setup container (defaults to CRAN) and can be
-overridden through a profile's `env` too. The one-time restore re-runs whenever the renv lockfile, the forwarded
-env, or the image changes, so configuration edits always take effect.
+overridden through a profile's `env` too.
+
+When a project has a `renv.lock`, dependency setup runs on every launch: `renv::restore()` is a fast no-op when
+the library already satisfies the lockfile, so a synced project pays ~1-2s and setup self-heals if the library
+drifts. There is no cached setup state that can go stale. When the project activates renv (its `.Rprofile`), the
+restore targets the renv-managed project library -- the same library the app and tests use at runtime. If a
+project has a `renv.lock` but does not activate renv, setup warns loudly and falls back to the shared site
+library (`R_LIBS_SITE`, see below), which the runtime always reads.
 
 The config file is strict: unknown fields anywhere (top level, `[build]`, or a profile) fail to parse instead of
 being silently ignored.
@@ -69,6 +75,11 @@ container uses the same XDG dirs, so the renv package cache is shared and warm a
 and opencode sessions. This keeps renv libraries/caches and sass caches writable (the container runs
 `--read-only`) and warm across runs. renv's OS-specific path prefix (`RENV_PATHS_PREFIX_AUTO`) keeps
 Alpine-container artifacts separate from anything produced by R on the host itself.
+
+The shared site library `~/.local/share/opencode-docker/r-library` maps to `R_LIBS_SITE=/opt/r-library` in both
+the setup and runtime containers. It is the persistent library for R projects without renv (in-session package
+installs survive across runs, since the container `HOME` is ephemeral) and the fallback target for `renv.lock`
+projects that do not activate renv.
 
 ## Keeping images fresh with systemd
 

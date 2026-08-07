@@ -9,8 +9,6 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "5"
-md-5 = "0.10"
-digest = "0.10"
 tempfile = "3"
 shellexpand = "3"
 libc = "0.2"

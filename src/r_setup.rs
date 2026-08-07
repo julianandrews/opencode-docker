@@ -1,13 +1,24 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::BufRead;
 
 use anyhow::{Context, Result};
-use digest::Digest;
 
 use crate::r;
 use crate::util;
 
+/// Ensure the project's R dependencies are installed.
+///
+/// Runs `renv::restore()` in a throwaway container on every launch instead of
+/// relying on a marker file: `renv::restore()` is a fast no-op when the
+/// library is synchronized with the lockfile (~1-2s), and self-heals when it
+/// is not. No persistent setup state exists that could go stale.
+///
+/// The script restores into the renv-managed project library when the project
+/// activates renv, and falls back to `R_LIBS_SITE` (with a loud warning) when
+/// it does not, so setup always targets the library the app reads at runtime.
+///
+/// Fails the launch on failure so a container never starts with a library
+/// that does not satisfy `renv.lock`.
 pub fn check_and_restore(image: &str, env_vars: &HashMap<String, String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let renv_lock = cwd.join("renv.lock");
@@ -15,25 +26,11 @@ pub fn check_and_restore(image: &str, env_vars: &HashMap<String, String>) -> Res
         return Ok(());
     }
 
-    let contents = fs::read_to_string(&renv_lock)
-        .with_context(|| format!("failed to read {}", renv_lock.display()))?;
-
-    let mut env_pairs: Vec<String> = env_vars.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    env_pairs.sort();
-    let image_id = image_id(image)?;
-    let key = format!("{}\n{}\n{}", contents, env_pairs.join("\n"), image_id);
-    let hash = format!("{:x}", md5::Md5::digest(key.as_bytes()));
+    println!("→ Ensuring R dependencies (renv.lock present)...");
 
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
     let r_lib_cache = home.join(".local/share/opencode-docker/r-library");
-    let marker = r_lib_cache.join(format!(".setup-{}", hash));
-
-    if marker.exists() {
-        return Ok(());
-    }
-
-    println!("→ Installing R dependencies (lockfile, env, or image changed)...");
     fs::create_dir_all(&r_lib_cache)?;
 
     let uid = util::uid();
@@ -97,30 +94,5 @@ pub fn check_and_restore(image: &str, env_vars: &HashMap<String, String>) -> Res
         anyhow::bail!("R dependency setup failed (exit code: {:?})", status.code());
     }
 
-    fs::File::create(&marker)?;
-
     Ok(())
-}
-
-fn image_id(name: &str) -> Result<String> {
-    let output = std::process::Command::new("docker")
-        .args(["image", "ls", "--format", "{{.ID}}", name])
-        .output()
-        .context("failed to run docker image ls")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "docker image ls failed (exit code: {:?}): {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let id = output
-        .stdout
-        .lines()
-        .next()
-        .transpose()?
-        .map(|l| l.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("image '{}' not found", name))?;
-    Ok(id)
 }
