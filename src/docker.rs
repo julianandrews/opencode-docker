@@ -56,6 +56,11 @@ impl DockerArgs {
         };
 
         let dirs_to_create = [
+            // Created host-side so the bind mount is owned by the host user:
+            // Docker would otherwise create it as root and the container's
+            // non-root user could not write cli.json/service.json (V2 mounts
+            // the config dir read-write for its first-run tui.json migration).
+            config.join("opencode"),
             cache.join("opencode"),
             data.join("opencode"),
             data.join("opencode/log"),
@@ -74,7 +79,7 @@ impl DockerArgs {
         }
         self.args.push("-v".into());
         self.args.push(format!(
-            "{}:/opencode/config/opencode:ro",
+            "{}:/opencode/config/opencode",
             config.join("opencode").display()
         ));
         self.args.push("-v".into());
@@ -87,6 +92,11 @@ impl DockerArgs {
             "{}:/opencode/data/opencode",
             data.join("opencode").display()
         ));
+        // opentui (the TUI framework V2 renders with) resolves its data path to
+        // `$XDG_DATA_HOME/opentui`, where its Tree-sitter highlight worker caches
+        // parsers and queries. Without this writable mount the worker fails
+        // silently and markdown/code highlighting degrades to raw text for
+        // non-root runs, so do not remove it (see README "OpenCode V2").
         self.args.push("-v".into());
         self.args.push(format!(
             "{}:/opencode/data/opentui",
@@ -317,6 +327,20 @@ mod tests {
         assert!(args.contains(&"/tmp:exec".to_string()));
         assert!(args.contains(&"host.docker.internal:host-gateway".to_string()));
         assert!(args.contains(&"/etc/localtime:/etc/localtime:ro".to_string()));
+    }
+
+    #[test]
+    fn xdg_dirs_mounts_opentui_data_path() {
+        // The TUI's Tree-sitter highlight worker caches under `$XDG_DATA_HOME/opentui`;
+        // without this writable mount the worker fails silently and markdown/code
+        // highlighting degrades to raw text for non-root runs.
+        let mut da = DockerArgs::new();
+        da.xdg_dirs().unwrap();
+        let args = da.into_vec();
+        assert!(
+            args.iter().any(|a| a.ends_with(":/opencode/data/opentui")),
+            "opentui data-path mount missing: {args:?}"
+        );
     }
 
     #[test]

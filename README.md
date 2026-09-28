@@ -8,10 +8,11 @@ Runs use the pre-built image for your feature set (`opencode-local`, `opencode-l
 `opencode-local-r-rust`) when that set is one of the `[build]` variants, so startups are instant. Freshness is
 maintained out-of-band:
 
-- `opencode-docker --build` pulls the latest `ghcr.io/anomalyco/opencode` and rebuilds the configured feature
-  variants. This is the only command that talks to the registry.
-- A systemd timer runs `--build` daily (see below), so variant images are at most ~1 day behind the latest
-  release.
+- `opencode-docker --build` pulls the configured base image (default `ghcr.io/anomalyco/opencode:2.0.18`, the current
+  OpenCode V2 release; override with `[build] base_image`) and rebuilds the configured feature variants. This is the
+  only command that talks to the registry.
+- A systemd timer runs `--build` daily (see below), so variant images are at most ~1 day behind the configured base
+  image tag.
 - If a variant image is missing locally (fresh install, pruned cache), a one-time build happens automatically on
   the next run, using only local layers — the base image is pulled only if it is missing too, so variant runs
   never talk to the registry.
@@ -41,6 +42,12 @@ default_features = ["R", "Rust"]
 # If unset, defaults to the no-feature image plus `default_features`.
 [build]
 variants = [[], ["R"], ["Rust"], ["R", "Rust"]]
+
+# Base image (with tag) the variants are built FROM. Defaults to the current
+# OpenCode V2 release. Bump this to track newer V2 releases; the daily --build
+# then pulls the new tag. Note that the `latest` tag still tracks the V1
+# release, so always pin an explicit V2 tag here.
+# base_image = "ghcr.io/anomalyco/opencode:2.0.18"
 
 [profile.myenv]
 env = { FOO = "bar" }
@@ -81,6 +88,22 @@ the setup and runtime containers. It is the persistent library for R projects wi
 installs survive across runs, since the container `HOME` is ephemeral) and the fallback target for `renv.lock`
 projects that do not activate renv.
 
+## OpenCode V2
+
+Runs use the OpenCode V2 release (default `[build] base_image = "ghcr.io/anomalyco/opencode:2.0.18"`). Moving to V2:
+
+- V1 session history is imported into the shared `~/.local/share/opencode/opencode.db` on first V2 run. Make a backup
+  of that database before switching if you want a rollback path (V2 is beta and data may be reset).
+- Existing `opencode.json(c)` config and `.opencode/` definitions keep working (V2 reads them in-memory). Terminal
+  settings are auto-migrated from `tui.json` to `cli.json` on first startup, which is why the
+  `~/.config/opencode` mount is now read-write.
+- The `~/.local/share/opentui` mount is kept: V2's TUI renders through opentui, which resolves its data path to
+  `$XDG_DATA_HOME/opentui` (`/opencode/data/opentui`). Its Tree-sitter highlight worker caches parsers and queries
+  there. Removing the mount makes the worker fail silently and markdown/code highlighting degrade to raw text for
+  non-root runs.
+- The TUI runs `opencode --standalone` (a private server over stdio) instead of V1's `--hostname 0.0.0.0 --port`, which
+  V2 does not accept on the default command. `serve` still takes `--hostname`/`--port`, and `run` runs standalone.
+
 ## Keeping images fresh with systemd
 
 The timer runs `opencode-docker --build` once a day and rebuilds only what changed (the base `--pull` build is a
@@ -111,5 +134,11 @@ Notes:
 opencode-docker                          # run in the current directory
 opencode-docker -p myenv                 # use a profile
 opencode-docker --feature Rust           # enable Rust toolchain for this run
-opencode-docker -P 8080 serve            # pass remaining args to opencode
+opencode-docker -P 8080 serve            # run `serve` (headless API + web), passing remaining args to opencode
 ```
+
+The TUI runs `opencode --standalone`, so each container gets a private server over stdio (no port to expose). The
+`-P <port>` flag only applies to `serve`, which runs `opencode serve --hostname 0.0.0.0 --port <port>`. Note that
+`serve` prints a random server password you'll need to connect a browser or `opencode --server` from the host; set
+`OPENCODE_SERVER_PASSWORD` via a profile `env` to use a fixed one. The V1 `web` subcommand is gone in V2 (`serve`
+serves both the API and web UI).

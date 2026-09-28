@@ -50,6 +50,20 @@ pub struct BuildConfig {
     /// (or `[[]]` when no default features are configured).
     #[serde(default)]
     pub variants: Vec<Vec<Feature>>,
+    /// Base image (with tag) the variants are built FROM. Defaults to the
+    /// current opencode V2 release.
+    #[serde(default)]
+    pub base_image: Option<String>,
+}
+
+pub const DEFAULT_BASE_IMAGE: &str = "ghcr.io/anomalyco/opencode:2.0.18";
+
+impl BuildConfig {
+    pub fn base_image(&self) -> String {
+        self.base_image
+            .clone()
+            .unwrap_or_else(|| DEFAULT_BASE_IMAGE.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -256,6 +270,22 @@ variants = [["R"], ["Rust"], ["R", "Rust"]]
                 vec![Feature::R, Feature::Rust],
             ]
         );
+    }
+
+    #[test]
+    fn base_image_defaults_to_v2() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.build.base_image(), DEFAULT_BASE_IMAGE);
+    }
+
+    #[test]
+    fn base_image_parses() {
+        let toml_str = r#"
+[build]
+base_image = "ghcr.io/anomalyco/opencode:beta"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.build.base_image(), "ghcr.io/anomalyco/opencode:beta");
     }
 
     #[test]

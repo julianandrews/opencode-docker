@@ -103,26 +103,41 @@ fn main() -> Result<()> {
 fn resolve_image(cfg: &config::ResolvedConfig) -> Result<String> {
     let image = config::image_name_for(&cfg.features);
     if config::variants_contain(&cfg.build, &cfg.default_features, &cfg.features) {
-        ensure_image(&image, &cfg.features)?;
+        ensure_image(&image, &cfg.features, &cfg.build.base_image())?;
     } else {
         eprintln!(
             "Feature set {image} is not in the [build] variants; rebuilding on every run (add it there to make runs instant)."
         );
-        build_variant(&cfg.features, &image, true)?;
+        build_variant(&cfg.features, &image, &cfg.build.base_image(), true)?;
     }
     Ok(image)
 }
 
 fn run_container(cfg: &config::ResolvedConfig, image: &str, extra_args: &[String]) -> Result<()> {
+    let subcommand = extra_args.first().map(String::as_str);
     let mut da = docker::DockerArgs::new();
     da.base()
         .xdg_dirs()?
         .workspace()?
         .security()
         .network()
-        .git_config()?
-        .ports(&cfg.ports)
-        .extra_mounts(&cfg.mounts)?
+        .git_config()?;
+    // The TUI runs a private server over stdio in V2, so `-P` only maps a host
+    // port when running `serve`.
+    if subcommand == Some("serve") {
+        da.ports(&cfg.ports);
+    } else if !cfg.ports.is_empty() {
+        let ports = cfg
+            .ports
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "Warning: -P {ports} ignored: ports only apply to `serve` (the TUI runs over stdio in V2)."
+        );
+    }
+    da.extra_mounts(&cfg.mounts)?
         .audio(cfg.audio)?
         .env_vars(&cfg.env_vars);
 
@@ -135,12 +150,7 @@ fn run_container(cfg: &config::ResolvedConfig, image: &str, extra_args: &[String
 
     let docker_args = da.into_vec();
 
-    let mut opencode_args = vec!["--hostname".to_string(), "0.0.0.0".to_string()];
-    if let Some(&port) = cfg.ports.first() {
-        opencode_args.push("--port".to_string());
-        opencode_args.push(port.to_string());
-    }
-    opencode_args.extend(extra_args.iter().cloned());
+    let opencode_args = opencode_command(cfg.ports.first().copied(), extra_args);
 
     let status = std::process::Command::new("docker")
         .arg("run")
@@ -151,6 +161,51 @@ fn run_container(cfg: &config::ResolvedConfig, image: &str, extra_args: &[String
         .context("failed to execute docker")?;
 
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Build the `opencode` argument vector for a run.
+///
+/// V2 is subcommand-based with a strict root: the TUI (default command) runs a
+/// private server over stdio via `--standalone`; `serve` takes the network
+/// flags after the subcommand; `run` also runs standalone.
+fn opencode_command(port: Option<u16>, extra_args: &[String]) -> Vec<String> {
+    let subcommand = extra_args.first().map(String::as_str);
+    let mut args = Vec::new();
+
+    match subcommand {
+        Some("serve") => {
+            args.push("serve".to_string());
+            push_hostname_port(&mut args, port);
+            args.extend(extra_args.iter().skip(1).cloned());
+        }
+        Some("run") => {
+            args.push("run".to_string());
+            push_standalone(&mut args, &extra_args[1..]);
+            args.extend(extra_args.iter().skip(1).cloned());
+        }
+        _ => {
+            push_standalone(&mut args, extra_args);
+            args.extend(extra_args.iter().cloned());
+        }
+    }
+    args
+}
+
+fn push_hostname_port(args: &mut Vec<String>, port: Option<u16>) {
+    args.push("--hostname".to_string());
+    args.push("0.0.0.0".to_string());
+    if let Some(port) = port {
+        args.push("--port".to_string());
+        args.push(port.to_string());
+    }
+}
+
+/// Add `--standalone` unless the user already picked a connection mode.
+fn push_standalone(args: &mut Vec<String>, rest: &[String]) {
+    let explicit = rest.iter().any(|a| a == "--standalone" || a == "--server");
+    if !explicit {
+        args.push("--standalone".to_string());
+    }
 }
 
 fn check_cwd() -> Result<()> {
@@ -187,8 +242,8 @@ fn confirm_or_exit(lines: &[String]) -> Result<()> {
 }
 
 fn cmd_build(cli: &Cli) -> Result<()> {
+    let cfg = config::load_config()?;
     let variants = if cli.feature.is_empty() {
-        let cfg = config::load_config()?;
         config::default_variants(&cfg.build, &cfg.default_features)
     } else {
         vec![cli.feature.clone()]
@@ -210,7 +265,7 @@ fn cmd_build(cli: &Cli) -> Result<()> {
                 .join("+")
         };
         println!("Building {name} ({label})");
-        build_variant(features, &name, true)?;
+        build_variant(features, &name, &cfg.build.base_image(), true)?;
     }
     prune_images()?;
     Ok(())
@@ -263,17 +318,17 @@ fn image_exists(name: &str) -> Result<bool> {
     Ok(!output.stdout.is_empty())
 }
 
-fn ensure_image(name: &str, features: &[Feature]) -> Result<()> {
+fn ensure_image(name: &str, features: &[Feature], base_image: &str) -> Result<()> {
     if image_exists(name)? {
         return Ok(());
     }
     eprintln!(
         "Image '{name}' not found locally; building it now (pre-build it with `opencode-docker --build` or the systemd timer to keep startups instant)."
     );
-    build_variant(features, name, false)
+    build_variant(features, name, base_image, false)
 }
 
-fn build_variant(features: &[Feature], tag: &str, pull: bool) -> Result<()> {
+fn build_variant(features: &[Feature], tag: &str, base_image: &str, pull: bool) -> Result<()> {
     let has_r = features.contains(&Feature::R);
     let has_rust = features.contains(&Feature::Rust);
     let tmp = tempfile::tempdir()?;
@@ -284,6 +339,7 @@ fn build_variant(features: &[Feature], tag: &str, pull: bool) -> Result<()> {
     if pull {
         cmd.arg("--pull");
     }
+    cmd.args(["--build-arg", &format!("BASE_IMAGE={base_image}")]);
     if has_r {
         cmd.args(["--build-arg", "INCLUDE_R=true"]);
     }
@@ -294,4 +350,70 @@ fn build_variant(features: &[Feature], tag: &str, pull: bool) -> Result<()> {
         anyhow::bail!("docker build failed (exit code: {:?})", status.code());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn tui_default_gets_standalone() {
+        assert_eq!(opencode_command(None, &s(&[])), s(&["--standalone"]));
+        assert_eq!(
+            opencode_command(Some(8080), &s(&["--model", "foo/bar"])),
+            s(&["--standalone", "--model", "foo/bar"])
+        );
+    }
+
+    #[test]
+    fn tui_with_server_skips_standalone() {
+        assert_eq!(
+            opencode_command(None, &s(&["--server", "http://localhost:4096"])),
+            s(&["--server", "http://localhost:4096"])
+        );
+        assert_eq!(
+            opencode_command(None, &s(&["--standalone", "--model", "foo/bar"])),
+            s(&["--standalone", "--model", "foo/bar"])
+        );
+    }
+
+    #[test]
+    fn serve_places_network_flags_after_subcommand() {
+        assert_eq!(
+            opencode_command(Some(8080), &s(&["serve"])),
+            s(&["serve", "--hostname", "0.0.0.0", "--port", "8080"])
+        );
+        assert_eq!(
+            opencode_command(None, &s(&["serve"])),
+            s(&["serve", "--hostname", "0.0.0.0"])
+        );
+        assert_eq!(
+            opencode_command(Some(8080), &s(&["serve", "--cors", "http://x"])),
+            s(&[
+                "serve",
+                "--hostname",
+                "0.0.0.0",
+                "--port",
+                "8080",
+                "--cors",
+                "http://x"
+            ])
+        );
+    }
+
+    #[test]
+    fn run_gets_standalone() {
+        assert_eq!(
+            opencode_command(None, &s(&["run", "hello"])),
+            s(&["run", "--standalone", "hello"])
+        );
+        assert_eq!(
+            opencode_command(None, &s(&["run", "--server", "http://x", "hello"])),
+            s(&["run", "--server", "http://x", "hello"])
+        );
+    }
 }

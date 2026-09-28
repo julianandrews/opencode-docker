@@ -1,7 +1,10 @@
+# Keep the default in sync with `DEFAULT_BASE_IMAGE` in src/config.rs.
+# The `latest` tag still tracks the V1 release, so pin an explicit V2 tag.
+ARG BASE_IMAGE=ghcr.io/anomalyco/opencode:2.0.18
 ARG INCLUDE_R=false
 ARG INCLUDE_RUST=false
 
-FROM ghcr.io/anomalyco/opencode
+FROM ${BASE_IMAGE}
 
 ARG INCLUDE_R
 ARG INCLUDE_RUST
