@@ -55,6 +55,7 @@ variants = [[], ["R"], ["Rust"], ["R", "Rust"]]
 [profile.myenv]
 env = { FOO = "bar" }
 ports = [8080]
+# edit_config = true   # mount the config dir read-write (see Permissions)
 ```
 
 Image names are canonical: features are deduplicated, sorted (R before Rust), and lowercased, so
@@ -108,6 +109,62 @@ Moving to V2:
 - The TUI runs `opencode --standalone` (a private server over stdio) instead of V1's `--hostname 0.0.0.0 --port`, which
   V2 does not accept on the default command. `serve` still takes `--hostname`/`--port`, and `run` runs standalone.
 
+## Permissions
+
+Agents run under a locked-down, opinionated permission policy. It lives in the host's `~/.config/opencode/opencode.json(c)`;
+there is no project-level config by default. If no opencode config file exists, the first run seeds the default policy
+(kept in `docker/opencode.jsonc.template`) host-side before starting the container — existing configs are never rewritten.
+
+What the default policy does:
+
+- **Reads are quiet for system paths.** The container rootfs is a read-only, ephemeral image with no host data, so
+  `/etc`, `/usr`, `/bin`, `/sbin`, `/lib`, `/opt`, `/var` etc. can be read without prompting (OS-level protections like
+  `/etc/shadow`'s root-only mode still apply). Credential files (`auth.json`, `account.json`, `service.json`) are
+  denied to the agent's tools outright; the session database, your git config under `/opencode/config/git`, and
+  `*.env*` files keep prompting. (opencode reads its own global config directory without prompting.)
+- **Agents can never modify their own setup.** Every existing global config file (`opencode.jsonc`, `opencode.json`,
+  `config.json` — opencode merges all of them) is bind-mounted **read-only** into the container, so even a compromised
+  agent cannot rewrite its permissions, and hard `deny` policies (`experimental.policies`) block editing the config
+  directory, the recorded shell/tool-output archives, the session database and the credential files
+  `auth.json`/`account.json`/`service.json` (config and state dirs) regardless of any approval. Policies cannot be
+  overridden by project configs or "allow always" approvals.
+- **Shell runs without prompting** (V2's allow-by-default base policy keeps the agent productive); only `git push` is
+  always denied.
+
+Edit permissions on the **host** (the global config files in `~/.config/opencode/`) — because they are mounted
+read-only, in-container commands that write global config (`opencode config set --global`, `opencode mcp add --global`)
+fail with a read-only filesystem error by design. `cli.json` and `service.json` stay writable (TUI settings, serve
+password). Plugin management is host-side too: `opencode plugin add` writes the global config, and the plugin surfaces —
+the discovery directory (`~/.config/opencode/plugins/`), `node_modules` and the package manifests — are mounted
+read-only, so a writable plugin target never exists for an agent to persist code that runs on every launch.
+
+Prefer editing from inside the container? Run with `--edit-config` (or set `edit_config = true` in a profile): it skips
+the read-only mounts for that run, so `opencode config set --global`, `opencode plugin add` and direct file edits work
+in-container and persist to the host config dir. Use it deliberately — in an `--edit-config` session an agent could also
+write those files via shell — and note that a profile turning it on prints a warning at launch; `--edit-config=false`
+forces locked mode back on even for such a profile.
+
+### Known limitations
+
+- Permission rules govern the agent's *tools*; a shell command still has the container user's full filesystem authority.
+  Anything an agent can `sh` can read (credentials, session data, the serve password) and — except for the read-only
+  mounts — write. The hardened mounts exist to prevent *self-escalation* (rewriting permissions) and silent plugin
+  persistence, not to sandbox hostile code: **the container is the trust boundary**.
+- Project-level plugins (`.opencode/plugins/` in a repository the agent writes) cannot be blocked without also blocking
+  workspace writes. The global `plugins` control list (`-` prefixes, e.g. `"-*"`) is the only lever against them, and a
+  repository can re-enable plugins it declares itself, so treat project plugin runs as "the agent wrote your repo".
+- **The container can reach your host loopback** (`host.docker.internal` is mapped to the host gateway): anything bound
+  to `127.0.0.1` on the host — local databases, dashboards, other `opencode serve` instances — is reachable from the
+  sandbox, and the serve password in `service.json` is readable by a shell-wielding agent. Don't run host services that
+  authenticate with secrets you would not hand the agent.
+- **The workspace is your real repo**: an agent can write `.git/hooks/` or rewrite remotes, and those execute on the
+  **host** at the next push/checkout with your full rights (including ssh-agent). The `git push` deny only blocks
+  in-session pushes.
+- **`-m/--mount` binds arbitrary host paths read-write** with no allowlist (`~/.ssh`, `/`, ... are accepted); mount
+  deliberately, and prefer `:ro`-style care — the passwordless sandbox is not a jail for host credentials.
+- **Environment values are agent-readable** (`-e`, profile `env`, `/proc/*/environ`); treat anything passed via env as
+  public to the session. Credentials belong in the workspace/`auth.json` flows you control, not in env.
+
 ## Keeping images fresh with systemd
 
 The timer runs `opencode-docker --build` once a day and rebuilds only what changed: with `[build] base_image` unset
@@ -142,6 +199,7 @@ Notes:
 opencode-docker                          # run in the current directory
 opencode-docker -p myenv                 # use a profile
 opencode-docker --feature Rust           # enable Rust toolchain for this run
+opencode-docker --edit-config            # mount the config dir read-write for in-container config/plugin edits
 opencode-docker -P 8080 serve            # run `serve` (headless API + web), passing remaining args to opencode
 ```
 

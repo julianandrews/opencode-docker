@@ -1,0 +1,55 @@
+{
+  // Default OpenCode configuration seeded by opencode-docker on first run
+  // (source of truth for src/docker.rs: DEFAULT_OPENCODE_CONFIG).
+  //
+  // Edit this file on the HOST: inside the container it is bind-mounted
+  // read-only, so agents cannot change their own permissions or config, and
+  // the deny policies below survive any project-level config or approval.
+  "$schema": "https://opencode.ai/config.json",
+
+  // --- Permissions (V2 rules; ordered, last match wins) ---
+
+  // Shell: allow-by-default (V2 base policy) so the agent works without
+  // constant prompting; always block pushes.
+  "permissions": [
+    { "action": "shell", "resource": "git push *", "effect": "deny" },
+
+    // Reads: the container rootfs is a read-only, ephemeral image, so system
+    // paths (/etc, /usr, /bin, /sbin, /lib, /opt, /var, ...) are safe to read
+    // without prompting. Host-mounted credentials, your git config and the
+    // session database keep prompting (opencode reads its own config dir
+    // without prompting).
+    { "action": "external_directory", "resource": "*", "effect": "allow" },
+    { "action": "external_directory", "resource": "/opencode", "effect": "ask" },
+    { "action": "external_directory", "resource": "/opencode/*", "effect": "ask" },
+
+    // The workspace mount and temp dirs are the agent's working surface.
+    { "action": "external_directory", "resource": "/workspace/*", "effect": "allow" },
+    { "action": "external_directory", "resource": "/tmp/*", "effect": "allow" },
+
+    // Credential-style files keep prompting (opencode's default; explicit here).
+    { "action": "read", "resource": "*.env", "effect": "ask" },
+    { "action": "read", "resource": "*.env.*", "effect": "ask" }
+  ],
+
+  // Policies are a hard-deny layer: they run after permission rules and saved
+  // "allow always" approvals, and project configs cannot lift them. Agents
+  // must never modify opencode's own configuration (including node_modules
+  // plugin installs), read/tamper credential files, rewrite the shell/tool
+  // output archives or the session database, or touch the service state.
+  "experimental": {
+    "policies": [
+      { "action": "permission", "resource": "edit:/opencode/config/opencode/*", "effect": "deny" },
+      { "action": "permission", "resource": "edit:/opencode/data/opencode/auth.json", "effect": "deny" },
+      { "action": "permission", "resource": "edit:/opencode/data/opencode/account.json", "effect": "deny" },
+      { "action": "permission", "resource": "read:/opencode/config/opencode/service.json", "effect": "deny" },
+      { "action": "permission", "resource": "read:/opencode/data/opencode/auth.json", "effect": "deny" },
+      { "action": "permission", "resource": "read:/opencode/data/opencode/account.json", "effect": "deny" },
+      { "action": "permission", "resource": "edit:/opencode/data/opencode/shell/*", "effect": "deny" },
+      { "action": "permission", "resource": "edit:/opencode/data/opencode/tool-output/*", "effect": "deny" },
+      { "action": "permission", "resource": "read:/opencode/state/opencode/service.json", "effect": "deny" },
+      { "action": "permission", "resource": "edit:/opencode/state/opencode/service.json", "effect": "deny" },
+      { "action": "permission", "resource": "edit:/opencode/data/opencode/opencode.db*", "effect": "deny" }
+    ]
+  }
+}

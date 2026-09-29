@@ -1,11 +1,19 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use crate::path;
 use crate::r;
 use crate::util;
+
+/// Default `opencode.jsonc` seeded into the host config dir on first run
+/// (source: `docker/opencode.jsonc.template`). The file is bind-mounted
+/// read-only into the container, so an agent can never rewrite its own
+/// permissions, and the `deny` policies inside survive any project config.
+const DEFAULT_OPENCODE_CONFIG: &str = include_str!("../docker/opencode.jsonc.template");
 
 #[derive(Debug)]
 pub struct DockerArgs {
@@ -43,8 +51,13 @@ impl DockerArgs {
         self
     }
 
-    pub fn xdg_dirs(&mut self) -> Result<&mut Self> {
-        let config = dirs::config_dir().context("config dir required")?;
+    /// `edit_config` is the deliberate `--edit-config` escape hatch: the config
+    /// files and the `plugins`/`node_modules` dirs are then left writable (no
+    /// read-only mounts) so config and plugins can be edited from inside the
+    /// container. `config_dir` is the host XDG config dir; it is injected so
+    /// the tests never touch the real one.
+    pub fn xdg_dirs(&mut self, config_dir: &Path, edit_config: bool) -> Result<&mut Self> {
+        let config = config_dir.to_path_buf();
         let cache = dirs::cache_dir().context("cache dir required")?;
         let data = dirs::data_dir().context("data dir required")?;
         let state = match dirs::state_dir() {
@@ -61,6 +74,11 @@ impl DockerArgs {
             // non-root user could not write cli.json/service.json (V2 mounts
             // the config dir read-write for its first-run tui.json migration).
             config.join("opencode"),
+            // The plugins dir and node_modules are created (and later mounted
+            // read-only) so writable targets for plugin code never exist in
+            // the container; see the mounts in xdg_dirs.
+            config.join("opencode/plugins"),
+            config.join("opencode/node_modules"),
             cache.join("opencode"),
             data.join("opencode"),
             data.join("opencode/log"),
@@ -82,6 +100,45 @@ impl DockerArgs {
             "{}:/opencode/config/opencode",
             config.join("opencode").display()
         ));
+        // Seed a default opencode config host-side when none exists yet (the
+        // host-side creation keeps the bind mount owned by the host user, like
+        // the dirs above). By default all existing global config files, the
+        // plugins dir, node_modules and the package manifests are then
+        // additionally mounted read-only: an agent must never be able to
+        // rewrite its own permissions or persist code that auto-loads on the
+        // next launch. `--edit-config` drops these mounts so config and
+        // plugins can be edited in-container. cli.json/service.json stay
+        // writable for the TUI either way.
+        let config_dir = config.join("opencode");
+        if edit_config {
+            let _ = seed_opencode_config(&config_dir);
+        } else {
+            for mount in opencode_config_mounts(&config_dir)? {
+                self.args.push("-v".into());
+                self.args.push(mount);
+            }
+            // opencode auto-discovers plugins dropped into its global plugins
+            // dir (any .ts/.js is loaded on the next launch), so the dir is
+            // mounted read-only: a writable plugins dir would let an agent
+            // persist arbitrary code in the host config dir. Plugin management
+            // therefore happens host-side. The mounts are only pushed when the
+            // host-side dirs exist: mounting a nonexistent source would make
+            // Docker create a root-owned directory in the user's config tree.
+            push_ro_dir_mount(self, &config_dir.join("plugins"), "plugins");
+            // Same for the npm plugin surface: node_modules and the package
+            // manifests are read-only in locked mode, so plugin packages can
+            // only be installed host-side (or in a --edit-config session).
+            // opencode never needs to write them at runtime; a plugin declared
+            // in config but not installed host-side just fails to auto-load.
+            push_ro_dir_mount(self, &config_dir.join("node_modules"), "node_modules");
+            for mount in existing_file_mounts(
+                &config_dir,
+                &["package.json", "package-lock.json", "bun.lock"],
+            ) {
+                self.args.push("-v".into());
+                self.args.push(mount);
+            }
+        }
         self.args.push("-v".into());
         self.args.push(format!(
             "{}:/opencode/cache/opencode",
@@ -283,6 +340,159 @@ impl DockerArgs {
     }
 }
 
+/// Build the host-side read-only mounts for the global opencode config
+/// files, creating the default config on first run if none exists yet.
+///
+/// opencode merges every existing global config file (`opencode.jsonc`,
+/// `opencode.json`, `config.json` — jsonc winning on conflicts), so *all* of
+/// them are mounted read-only; leaving one writable would defeat the "never
+/// rewrite your own permissions" guarantee. Returns an empty vector (with a
+/// warning) when no config file could be created.
+fn opencode_config_mounts(config_dir: &Path) -> Result<Vec<String>> {
+    let mut mounts = Vec::new();
+    for name in ["opencode.jsonc", "opencode.json", "config.json"] {
+        let path = config_dir.join(name);
+        if path.is_file() {
+            mounts.push(format!(
+                "{}:/opencode/config/opencode/{}:ro",
+                path.display(),
+                name
+            ));
+        }
+    }
+    if mounts.is_empty() {
+        // No global config yet: seed the default so a locked run still has
+        // something to protect (and mount it).
+        if let Some(file) = seed_opencode_config(config_dir) {
+            let name = file
+                .file_name()
+                .context("config file has no filename")?
+                .to_string_lossy();
+            mounts.push(format!(
+                "{}:/opencode/config/opencode/{}:ro",
+                file.display(),
+                name
+            ));
+        }
+    }
+    Ok(mounts)
+}
+
+/// Push a read-only mount for `dir` as `host:/opencode/config/opencode/<name>:ro`,
+/// skipping (with a warning) when the host-side dir does not exist: mounting a
+/// nonexistent source would make Docker create a root-owned directory in the
+/// user's config tree.
+fn push_ro_dir_mount(da: &mut DockerArgs, dir: &Path, name: &str) {
+    if !dir.is_dir() {
+        eprintln!(
+            "Warning: '{}' is missing; skipping the read-only mount for {name}.",
+            dir.display()
+        );
+        return;
+    }
+    da.args.push("-v".into());
+    da.args.push(format!(
+        "{}:/opencode/config/opencode/{}:ro",
+        dir.display(),
+        name
+    ));
+}
+
+/// Read-only mounts (`host:/opencode/config/opencode/<name>:ro`) for every
+/// existing file among `names` in `config_dir`, e.g. the npm package
+/// manifests. Missing files are skipped: there is nothing to protect, and
+/// mounting a nonexistent source would create a shadowing directory.
+fn existing_file_mounts(config_dir: &Path, names: &[&str]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| config_dir.join(name).is_file())
+        .map(|name| {
+            format!(
+                "{}:/opencode/config/opencode/{}:ro",
+                config_dir.join(name).display(),
+                name
+            )
+        })
+        .collect()
+}
+
+/// Seed the default opencode config if none exists, logging a warning when
+/// that fails (e.g. because the config dir is not writable): the run then
+/// simply proceeds without a config file to protect.
+fn seed_opencode_config(config_dir: &Path) -> Option<PathBuf> {
+    match ensure_opencode_config(config_dir) {
+        Ok(Some(file)) => Some(file),
+        Ok(None) => None,
+        Err(err) => {
+            eprintln!(
+                "Warning: could not seed a default opencode config in '{}' ({err:#}); running without one.",
+                config_dir.display()
+            );
+            None
+        }
+    }
+}
+
+/// Locate an existing opencode config file in `config_dir`, seeding the
+/// default template when none of the recognized names exists.
+///
+/// Existing configs are never rewritten: the template is only a first-run
+/// default (see `docker/opencode.jsonc.template`). A directory or broken
+/// symlink squatting on a recognized name is left untouched and blocks
+/// seeding rather than being clobbered.
+fn ensure_opencode_config(config_dir: &Path) -> Result<Option<PathBuf>> {
+    for name in ["opencode.jsonc", "opencode.json", "config.json"] {
+        let path = config_dir.join(name);
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            if meta.file_type().is_file() || meta.file_type().is_symlink() {
+                // A regular file, or a symlink to one (the bind mount
+                // resolves valid symlinks). Broken symlinks report is_file()
+                // false and fall through to the warning below.
+                if path.is_file() {
+                    return Ok(Some(path));
+                }
+            }
+            eprintln!(
+                "Warning: '{}' is not a readable config file; leaving it untouched and skipping config seeding.",
+                path.display()
+            );
+            return Ok(None);
+        }
+    }
+    let default = config_dir.join("opencode.jsonc");
+    fs::create_dir_all(config_dir).with_context(|| {
+        format!(
+            "failed to create opencode config directory '{}'",
+            config_dir.display()
+        )
+    })?;
+    // Write to a uniquely named temp file and rename into place, so
+    // concurrent first runs never observe (or publish) a torn file.
+    let mut tmp = tempfile::NamedTempFile::new_in(config_dir)
+        .with_context(|| format!("failed to create a temp file in '{}'", config_dir.display()))?;
+    tmp.write_all(DEFAULT_OPENCODE_CONFIG.as_bytes())
+        .with_context(|| {
+            format!(
+                "failed to write default opencode config to '{}'",
+                tmp.path().display()
+            )
+        })?;
+    if let Err(err) = tmp.persist(&default) {
+        // A concurrent first run may have published the config already;
+        // treat that as success rather than failing the run.
+        if default.is_file() {
+            return Ok(Some(default));
+        }
+        return Err(err).with_context(|| {
+            format!(
+                "failed to move default opencode config into place at '{}'",
+                default.display()
+            )
+        });
+    }
+    Ok(Some(default))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,13 +544,65 @@ mod tests {
         // The TUI's Tree-sitter highlight worker caches under `$XDG_DATA_HOME/opentui`;
         // without this writable mount the worker fails silently and markdown/code
         // highlighting degrades to raw text for non-root runs.
+        let tmp = tempfile::tempdir().unwrap();
         let mut da = DockerArgs::new();
-        da.xdg_dirs().unwrap();
+        da.xdg_dirs(tmp.path(), false).unwrap();
         let args = da.into_vec();
         assert!(
             args.iter().any(|a| a.ends_with(":/opencode/data/opentui")),
             "opentui data-path mount missing: {args:?}"
         );
+    }
+
+    #[test]
+    fn xdg_dirs_mounts_plugin_surface_readonly() {
+        // opencode auto-discovers plugins under the global config dir, and the
+        // npm plugin surface (node_modules + manifests) is installed there, so
+        // both must be read-only for agents in locked mode.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut da = DockerArgs::new();
+        da.xdg_dirs(tmp.path(), false).unwrap();
+        let args = da.into_vec();
+        assert!(
+            args.iter()
+                .any(|a| a.ends_with(":/opencode/config/opencode/plugins:ro")),
+            "plugins ro mount missing: {args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a.ends_with(":/opencode/config/opencode/node_modules:ro")),
+            "node_modules ro mount missing: {args:?}"
+        );
+        // The seeded default config is mounted ro too.
+        assert!(
+            args.iter()
+                .any(|a| a.ends_with(":/opencode/config/opencode/opencode.jsonc:ro")),
+            "config file ro mount missing: {args:?}"
+        );
+    }
+
+    #[test]
+    fn xdg_dirs_edit_config_skips_readonly_mounts() {
+        // `--edit-config` is the deliberate escape hatch: the config files,
+        // plugins dir and npm plugin surface are left writable (no ro mounts)
+        // so config and plugins can be edited from inside the container.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut da = DockerArgs::new();
+        da.xdg_dirs(tmp.path(), true).unwrap();
+        let args = da.into_vec();
+        for forbidden in [
+            "opencode.jsonc:ro",
+            "opencode.json:ro",
+            "config.json:ro",
+            "plugins:ro",
+            "node_modules:ro",
+            "package.json:ro",
+        ] {
+            assert!(
+                !args.iter().any(|a| a.contains(forbidden)),
+                "'{forbidden}' mount should be skipped with --edit-config: {args:?}"
+            );
+        }
     }
 
     #[test]
@@ -373,5 +635,97 @@ mod tests {
         let mut da = DockerArgs::new();
         let result = da.extra_mounts(&mounts);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_mounts_seed_default_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("opencode");
+        let mounts = opencode_config_mounts(&dir).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert!(mounts[0].ends_with(":/opencode/config/opencode/opencode.jsonc:ro"));
+        assert!(mounts[0].starts_with(&dir.display().to_string()));
+        let content = fs::read_to_string(dir.join("opencode.jsonc")).unwrap();
+        assert!(content.contains("\"permissions\""));
+        assert!(content.contains("edit:/opencode/config/opencode/*"));
+        assert!(content.contains("\"experimental\""));
+    }
+
+    #[test]
+    fn config_mounts_keep_existing_jsonc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("opencode");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("opencode.jsonc"), "{\"model\":\"x\"}").unwrap();
+        let mounts = opencode_config_mounts(&dir).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert!(mounts[0].ends_with(":/opencode/config/opencode/opencode.jsonc:ro"));
+        assert_eq!(
+            fs::read_to_string(dir.join("opencode.jsonc")).unwrap(),
+            "{\"model\":\"x\"}"
+        );
+    }
+
+    #[test]
+    fn config_mounts_protect_every_existing_config_file() {
+        // opencode merges all existing global config files, so all of them
+        // must be mounted read-only -- not just the precedence winner.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("opencode");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("opencode.json"), "{\"model\":\"y\"}").unwrap();
+        fs::write(dir.join("config.json"), "{\"model\":\"c\"}").unwrap();
+        let mounts = opencode_config_mounts(&dir).unwrap();
+        assert_eq!(mounts.len(), 2);
+        assert!(mounts.iter().any(|m| m.ends_with("opencode.json:ro")));
+        assert!(mounts.iter().any(|m| m.ends_with("config.json:ro")));
+        assert!(
+            !dir.join("opencode.jsonc").exists(),
+            "no seeding when a config exists"
+        );
+        // When a jsonc appears later it is mounted too, on top of the others.
+        fs::write(dir.join("opencode.jsonc"), "{\"model\":\"z\"}").unwrap();
+        let mounts = opencode_config_mounts(&dir).unwrap();
+        assert_eq!(mounts.len(), 3);
+        assert!(mounts.iter().any(|m| m.ends_with("opencode.jsonc:ro")));
+        assert_eq!(
+            fs::read_to_string(dir.join("opencode.json")).unwrap(),
+            "{\"model\":\"y\"}"
+        );
+    }
+
+    #[test]
+    fn config_mounts_skip_when_unwritable() {
+        // A file where the config directory would be needed makes seeding fail;
+        // the mount is skipped instead of failing the run.
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("opencode");
+        fs::write(&blocker, "x").unwrap();
+        assert!(opencode_config_mounts(&blocker).unwrap().is_empty());
+    }
+
+    #[test]
+    fn config_mounts_ignore_directory_shadowing_config() {
+        // A directory named like a config file is not a config file; the seed
+        // write then fails (the name is taken by a dir), so no mount is
+        // produced rather than mounting a directory over the file path.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("opencode");
+        fs::create_dir_all(dir.join("opencode.jsonc")).unwrap();
+        assert!(opencode_config_mounts(&dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn existing_file_mounts_only_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("package.json"), "{}").unwrap();
+        fs::write(tmp.path().join("bun.lock"), "").unwrap();
+        let mounts = existing_file_mounts(
+            tmp.path(),
+            &["package.json", "package-lock.json", "bun.lock"],
+        );
+        assert_eq!(mounts.len(), 2);
+        assert!(mounts[0].ends_with(":/opencode/config/opencode/package.json:ro"));
+        assert!(mounts[1].ends_with(":/opencode/config/opencode/bun.lock:ro"));
     }
 }

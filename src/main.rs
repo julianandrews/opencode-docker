@@ -43,13 +43,22 @@ struct Cli {
     #[arg(long = "no-default-features")]
     no_default_features: bool,
 
-    #[arg(short = 'L', long = "list-profiles", conflicts_with_all = &["profile", "port", "mount", "audio", "env", "feature", "no_default_features", "build"])]
+    #[arg(
+        long = "edit-config",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        help = "Mount the opencode config dir fully read-write so config and plugins can be edited inside the container (default: the config files, plugins dir and package manifests are read-only). Use --edit-config=false to force locked mode even when a profile enables it"
+    )]
+    edit_config: Option<bool>,
+
+    #[arg(short = 'L', long = "list-profiles", conflicts_with_all = &["profile", "port", "mount", "audio", "env", "feature", "no_default_features", "edit_config", "build"])]
     list_profiles: bool,
 
     #[arg(
         long = "build",
         help = "Build the configured feature variants and exit (used by the systemd timer)",
-        conflicts_with_all = &["profile", "port", "mount", "audio", "env", "no_default_features"]
+        conflicts_with_all = &["profile", "port", "mount", "audio", "env", "no_default_features", "edit_config"]
     )]
     build: bool,
 
@@ -80,6 +89,8 @@ fn main() -> Result<()> {
         return cmd_build(&cli);
     }
 
+    let profile_name = cli.profile.clone();
+    let edit_config_flag = cli.edit_config == Some(true);
     let cfg = config::resolve(&config::ResolveOptions {
         profile: cli.profile,
         env: cli.env,
@@ -88,7 +99,20 @@ fn main() -> Result<()> {
         audio: cli.audio,
         features: cli.feature,
         no_default_features: cli.no_default_features,
+        edit_config: cli.edit_config,
     })?;
+
+    // A profile can silently turn the hatch on for every run; an explicit
+    // `--edit-config` is a deliberate per-run decision and stays quiet.
+    if cfg.edit_config && !edit_config_flag {
+        let via = profile_name
+            .as_deref()
+            .map(|n| format!(" (via profile '{n}')"))
+            .unwrap_or_default();
+        eprintln!(
+            "\x1b[33mWarning: edit_config is enabled{via}: the opencode config files and plugins dir are writable in-container this run; agent writes persist to the host and all future runs.\x1b[0m"
+        );
+    }
 
     check_cwd()?;
 
@@ -116,9 +140,10 @@ fn resolve_image(cfg: &config::ResolvedConfig) -> Result<String> {
 
 fn run_container(cfg: &config::ResolvedConfig, image: &str, extra_args: &[String]) -> Result<()> {
     let subcommand = extra_args.first().map(String::as_str);
+    let config_dir = dirs::config_dir().context("config dir required")?;
     let mut da = docker::DockerArgs::new();
     da.base()
-        .xdg_dirs()?
+        .xdg_dirs(&config_dir, cfg.edit_config)?
         .workspace()?
         .security()
         .network()

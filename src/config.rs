@@ -80,6 +80,11 @@ pub struct Profile {
     pub ports: Option<Vec<u16>>,
     pub audio: Option<bool>,
     pub features: Option<Vec<Feature>>,
+    /// Mount the opencode config dir fully read-write so config and plugins
+    /// can be edited from inside the container (skip the read-only config
+    /// file and plugins mounts). Deliberate escape hatch; the CLI flag
+    /// `--edit-config` enables the same for a single run.
+    pub edit_config: Option<bool>,
 }
 
 fn config_path() -> Option<std::path::PathBuf> {
@@ -159,6 +164,9 @@ pub struct ResolveOptions {
     pub audio: Option<bool>,
     pub features: Vec<Feature>,
     pub no_default_features: bool,
+    /// `Some(true)`/`Some(false)` from the CLI flag; `None` defers to the
+    /// profile value (CLI trumps profile, like `audio`).
+    pub edit_config: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +178,7 @@ pub struct ResolvedConfig {
     pub features: Vec<Feature>,
     pub build: BuildConfig,
     pub default_features: Vec<Feature>,
+    pub edit_config: bool,
 }
 
 pub fn resolve(opts: &ResolveOptions) -> Result<ResolvedConfig> {
@@ -219,6 +228,11 @@ pub(crate) fn resolve_from(config: &Config, opts: &ResolveOptions) -> ResolvedCo
         config.default_features.clone()
     };
 
+    let edit_config = opts
+        .edit_config
+        .or_else(|| profile.as_ref().and_then(|p| p.edit_config))
+        .unwrap_or(false);
+
     ResolvedConfig {
         env_vars,
         ports,
@@ -227,6 +241,7 @@ pub(crate) fn resolve_from(config: &Config, opts: &ResolveOptions) -> ResolvedCo
         features,
         build: config.build.clone(),
         default_features: config.default_features.clone(),
+        edit_config,
     }
 }
 
@@ -479,6 +494,7 @@ default_feature = ["R"]
             audio: None,
             features: cli_features,
             no_default_features: no_default,
+            edit_config: None,
         };
         resolve_from(&config, &opts).features
     }
@@ -573,5 +589,61 @@ features = []
             run_resolve(toml_str, Some("plain"), vec![], false),
             Vec::<Feature>::new()
         );
+    }
+
+    #[test]
+    fn resolve_edit_config_from_flag_or_profile() {
+        let toml_str = r#"
+[profile.lax]
+edit_config = true
+[profile.strict]
+edit_config = false
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+
+        let base_opts = || ResolveOptions {
+            profile: None,
+            env: Vec::new(),
+            ports: Vec::new(),
+            mounts: Vec::new(),
+            audio: None,
+            features: Vec::new(),
+            no_default_features: false,
+            edit_config: None,
+        };
+
+        // Default: locked.
+        assert!(!resolve_from(&config, &base_opts()).edit_config);
+        // Flag true turns it on.
+        let flag_on = ResolveOptions {
+            edit_config: Some(true),
+            ..base_opts()
+        };
+        assert!(resolve_from(&config, &flag_on).edit_config);
+        // Profile true turns it on when the flag is absent.
+        let lax = ResolveOptions {
+            profile: Some("lax".to_string()),
+            ..base_opts()
+        };
+        assert!(resolve_from(&config, &lax).edit_config);
+        // Profile false keeps it off.
+        let strict = ResolveOptions {
+            profile: Some("strict".to_string()),
+            ..base_opts()
+        };
+        assert!(!resolve_from(&config, &strict).edit_config);
+        // CLI beats profile in both directions, like `audio`.
+        let strict_flag = ResolveOptions {
+            profile: Some("strict".to_string()),
+            edit_config: Some(true),
+            ..base_opts()
+        };
+        assert!(resolve_from(&config, &strict_flag).edit_config);
+        let lax_flag_off = ResolveOptions {
+            profile: Some("lax".to_string()),
+            edit_config: Some(false),
+            ..base_opts()
+        };
+        assert!(!resolve_from(&config, &lax_flag_off).edit_config);
     }
 }
