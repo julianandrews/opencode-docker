@@ -128,7 +128,7 @@ What the default policy does:
 - **Tool writes outside the workspace need the seeded rules.** The `write`/`edit`/`patch` tools require an
   `external_directory` allowance for any path outside the active Location before an edit is approved — including the
   container's writable tmpfs. The default policy allows `/workspace/*` and `/tmp/*`; opencode's own scratch dir
-  (`/tmp/opencode`) is always allowed by its base defaults. Without those rules the base policy's
+  (`/tmp/opencode`) is allowed by its base defaults unless a rule overrides it. Without those rules the base policy's
   `external_directory * -> ask` applies, and headless agents (subagents, `opencode run`) are blocked instead of
   prompted.
 - **Agents can never modify their own setup.** Every existing global config file (`opencode.jsonc`, `opencode.json`,

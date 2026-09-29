@@ -651,10 +651,15 @@ mod tests {
         assert!(content.contains("\"experimental\""));
         // The agent's working surface outside the workspace: the write/edit
         // tools require an `external_directory` allowance for any path beyond
-        // the active Location. Without the `/tmp/*` (and `/workspace/*`)
-        // rules, the base policy's `external_directory * -> ask` applies and
-        // headless agents get blocked writing scratch files (regression:
-        // agents blocked from writing to /tmp).
+        // the active Location. The catch-all `*` rule is load-bearing (its
+        // removal re-blocks every external path), and the `/workspace/*` and
+        // `/tmp/*` rules are the explicit working-surface allowances; without
+        // the seeded rules the base policy's `external_directory * -> ask`
+        // applies and headless agents get blocked writing scratch files
+        // (regression: agents blocked from writing to /tmp).
+        assert!(content.contains(
+            "{ \"action\": \"external_directory\", \"resource\": \"*\", \"effect\": \"allow\" }"
+        ));
         assert!(content.contains(
             "{ \"action\": \"external_directory\", \"resource\": \"/workspace/*\", \"effect\": \"allow\" }"
         ));
