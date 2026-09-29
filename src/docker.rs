@@ -666,6 +666,28 @@ mod tests {
         assert!(content.contains(
             "{ \"action\": \"external_directory\", \"resource\": \"/tmp/*\", \"effect\": \"allow\" }"
         ));
+        // Shared feature-toolchain homes (`CARGO_HOME`, R's XDG dirs) and
+        // opencode's cache are build cache, not secrets: the seed allows them
+        // so builds don't prompt. The `/opencode/*` ask rule must stay
+        // *before* these allowances (last match wins), and cargo's credential
+        // files keep prompting like the `*.env` rules.
+        for rule in [
+            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/cargo/*\", \"effect\": \"allow\" }",
+            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/cache/R/*\", \"effect\": \"allow\" }",
+            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/data/R/*\", \"effect\": \"allow\" }",
+            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/config/R/*\", \"effect\": \"allow\" }",
+            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/state/R/*\", \"effect\": \"allow\" }",
+            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/cache/opencode/*\", \"effect\": \"allow\" }",
+            "{ \"action\": \"read\", \"resource\": \"/opencode/cargo/credentials*\", \"effect\": \"ask\" }",
+        ] {
+            assert!(content.contains(rule), "missing seeded rule: {rule}");
+        }
+        let opencode_ask = "{ \"action\": \"external_directory\", \"resource\": \"/opencode/*\", \"effect\": \"ask\" }";
+        let cargo_allow = "{ \"action\": \"external_directory\", \"resource\": \"/opencode/cargo/*\", \"effect\": \"allow\" }";
+        assert!(
+            content.find(opencode_ask).unwrap() < content.find(cargo_allow).unwrap(),
+            "the /opencode/* ask rule must precede the /opencode/cargo/* allowance (last match wins)"
+        );
     }
 
     #[test]

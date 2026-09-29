@@ -23,13 +23,26 @@
     { "action": "external_directory", "resource": "/opencode", "effect": "ask" },
     { "action": "external_directory", "resource": "/opencode/*", "effect": "ask" },
 
+    // Shared feature-toolchain homes are build cache, not secrets: the Rust
+    // CARGO_HOME (registry index, crate sources) and R's XDG dirs (renv
+    // libraries, caches) are read and written during builds, so they stay
+    // quiet; opencode's own cache too. Cargo's credential files keep
+    // prompting (see the read rules below).
+    { "action": "external_directory", "resource": "/opencode/cargo/*", "effect": "allow" },
+    { "action": "external_directory", "resource": "/opencode/cache/R/*", "effect": "allow" },
+    { "action": "external_directory", "resource": "/opencode/data/R/*", "effect": "allow" },
+    { "action": "external_directory", "resource": "/opencode/config/R/*", "effect": "allow" },
+    { "action": "external_directory", "resource": "/opencode/state/R/*", "effect": "allow" },
+    { "action": "external_directory", "resource": "/opencode/cache/opencode/*", "effect": "allow" },
+
     // The workspace mount and temp dirs are the agent's working surface.
     { "action": "external_directory", "resource": "/workspace/*", "effect": "allow" },
     { "action": "external_directory", "resource": "/tmp/*", "effect": "allow" },
 
     // Credential-style files keep prompting (opencode's default; explicit here).
     { "action": "read", "resource": "*.env", "effect": "ask" },
-    { "action": "read", "resource": "*.env.*", "effect": "ask" }
+    { "action": "read", "resource": "*.env.*", "effect": "ask" },
+    { "action": "read", "resource": "/opencode/cargo/credentials*", "effect": "ask" }
   ],
 
   // Policies are a hard-deny layer: they run after permission rules and saved

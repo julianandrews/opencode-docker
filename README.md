@@ -131,6 +131,11 @@ What the default policy does:
   (`/tmp/opencode`) is allowed by its base defaults unless a rule overrides it. Without those rules the base policy's
   `external_directory * -> ask` applies, and headless agents (subagents, `opencode run`) are blocked instead of
   prompted.
+- **Feature toolchain homes stay quiet.** With the Rust/R features, the shared tool homes — the `CARGO_HOME` build
+  cache at `/opencode/cargo` (registry index, crate sources), R's XDG dirs (`/opencode/cache/R`, `/opencode/data/R`,
+  `/opencode/config/R`, `/opencode/state/R`), and opencode's own `/opencode/cache/opencode` — are allowed without
+  prompting: agents read and write them during builds, and they hold no secrets. Cargo's credential files
+  (`credentials`, `credentials.toml`) still prompt.
 - **Agents can never modify their own setup.** Every existing global config file (`opencode.jsonc`, `opencode.json`,
   `config.json` — opencode merges all of them) is bind-mounted **read-only** into the container, so even a compromised
   agent cannot rewrite its permissions, and hard `deny` policies (`experimental.policies`) block editing the config
