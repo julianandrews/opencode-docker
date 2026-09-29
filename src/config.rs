@@ -50,13 +50,19 @@ pub struct BuildConfig {
     /// (or `[[]]` when no default features are configured).
     #[serde(default)]
     pub variants: Vec<Vec<Feature>>,
-    /// Base image (with tag) the variants are built FROM. Defaults to the
-    /// current opencode V2 release.
+    /// Base image (with tag) the variants are built FROM. When unset,
+    /// `--build` auto-tracks the newest opencode V2 release tag from the
+    /// registry; set this to pin a specific tag (e.g. to freeze on a
+    /// known-good release). Falls back to `DEFAULT_BASE_IMAGE` when the
+    /// registry can't be reached or at run time.
     #[serde(default)]
     pub base_image: Option<String>,
 }
 
-pub const DEFAULT_BASE_IMAGE: &str = "ghcr.io/anomalyco/opencode:2.0.18";
+/// Fallback base image for `--build` when the registry can't be reached, and
+/// the base used by run-time builds (which never talk to the registry).
+/// Keep in sync with the Dockerfile `ARG BASE_IMAGE` default.
+pub const DEFAULT_BASE_IMAGE: &str = "ghcr.io/anomalyco/opencode:2.0.19";
 
 impl BuildConfig {
     pub fn base_image(&self) -> String {

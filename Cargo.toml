@@ -12,3 +12,4 @@ dirs = "5"
 tempfile = "3"
 shellexpand = "3"
 libc = "0.2"
+ureq = { version = "3", features = ["json"] }

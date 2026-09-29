@@ -8,11 +8,11 @@ Runs use the pre-built image for your feature set (`opencode-local`, `opencode-l
 `opencode-local-r-rust`) when that set is one of the `[build]` variants, so startups are instant. Freshness is
 maintained out-of-band:
 
-- `opencode-docker --build` pulls the configured base image (default `ghcr.io/anomalyco/opencode:2.0.18`, the current
-  OpenCode V2 release; override with `[build] base_image`) and rebuilds the configured feature variants. This is the
-  only command that talks to the registry.
-- A systemd timer runs `--build` daily (see below), so variant images are at most ~1 day behind the configured base
-  image tag.
+- `opencode-docker --build` rebuilds the configured feature variants FROM the newest OpenCode V2 release: when
+  `[build] base_image` is unset it queries the registry and uses the newest `2.x` release tag; set `base_image` to
+  pin a specific tag instead. This is the only command that queries the registry for the release tag.
+- A systemd timer runs `--build` daily (see below), so variant images are at most ~1 day behind the latest OpenCode
+  V2 release.
 - If a variant image is missing locally (fresh install, pruned cache), a one-time build happens automatically on
   the next run, using only local layers — the base image is pulled only if it is missing too, so variant runs
   never talk to the registry.
@@ -43,11 +43,14 @@ default_features = ["R", "Rust"]
 [build]
 variants = [[], ["R"], ["Rust"], ["R", "Rust"]]
 
-# Base image (with tag) the variants are built FROM. Defaults to the current
-# OpenCode V2 release. Bump this to track newer V2 releases; the daily --build
-# then pulls the new tag. Note that the `latest` tag still tracks the V1
-# release, so always pin an explicit V2 tag here.
-# base_image = "ghcr.io/anomalyco/opencode:2.0.18"
+# Base image (with tag) the variants are built FROM. Leave unset to
+# auto-track the newest OpenCode V2 release on every --build (the daily timer
+# then keeps variants current without manual bumps). Set it to pin an exact
+# tag, e.g. to freeze on a known-good release. When unset, runs and failed
+# registry lookups fall back to the compiled-in default (2.0.19). Note that
+# the `latest` tag still tracks the V1 release, so always use an explicit V2
+# tag when pinning.
+# base_image = "ghcr.io/anomalyco/opencode:2.0.19"
 
 [profile.myenv]
 env = { FOO = "bar" }
@@ -90,7 +93,8 @@ projects that do not activate renv.
 
 ## OpenCode V2
 
-Runs use the OpenCode V2 release (default `[build] base_image = "ghcr.io/anomalyco/opencode:2.0.18"`). Moving to V2:
+Runs use the OpenCode V2 release, auto-tracked by `--build` (fallback default `2.0.19`, or pin with `[build] base_image`).
+Moving to V2:
 
 - V1 session history is imported into the shared `~/.local/share/opencode/opencode.db` on first V2 run. Make a backup
   of that database before switching if you want a rollback path (V2 is beta and data may be reset).
@@ -106,8 +110,9 @@ Runs use the OpenCode V2 release (default `[build] base_image = "ghcr.io/anomaly
 
 ## Keeping images fresh with systemd
 
-The timer runs `opencode-docker --build` once a day and rebuilds only what changed (the base `--pull` build is a
-cache hit when there is no new release). Install it for your user:
+The timer runs `opencode-docker --build` once a day and rebuilds only what changed: with `[build] base_image` unset
+it resolves the newest OpenCode V2 release and the base `--pull` build is a cache hit when there is no new release.
+Install it for your user:
 
 ```sh
 install -m644 packaging/opencode-docker-build.timer packaging/opencode-docker-build.service \
@@ -125,6 +130,9 @@ Notes:
 - On headless machines, run `loginctl enable-linger $USER` so user units start at boot.
 - `Persistent=true` catches up after the machine was off.
 - Manual refresh: `opencode-docker --build` or `opencode-docker --build --feature R` for a single variant.
+- New releases are picked up automatically: when `base_image` is unset, `--build` prints the resolved release
+  (e.g. `Newest OpenCode V2 release: ghcr.io/anomalyco/opencode:2.0.19`) before building. If the registry is
+  unreachable it falls back to the compiled-in default and warns, so the timer never hard-fails.
 - After building, `--build` also prunes dangling images (`docker image prune -f`) and keeps the build cache
   capped at 10 GB (`docker builder prune --keep-storage=10G`), so daily rebuilds don't grow disk usage unbounded.
 

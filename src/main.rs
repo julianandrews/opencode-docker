@@ -6,6 +6,7 @@ mod docker;
 mod path;
 mod r;
 mod r_setup;
+mod registry;
 mod util;
 
 use config::Feature;
@@ -249,6 +250,8 @@ fn cmd_build(cli: &Cli) -> Result<()> {
         vec![cli.feature.clone()]
     };
 
+    let base_image = build_base_image(&cfg);
+
     let mut seen = std::collections::HashSet::new();
     for features in &variants {
         let name = config::image_name_for(features);
@@ -265,10 +268,53 @@ fn cmd_build(cli: &Cli) -> Result<()> {
                 .join("+")
         };
         println!("Building {name} ({label})");
-        build_variant(features, &name, &cfg.build.base_image(), true)?;
+        build_variant(features, &name, &base_image, true)?;
     }
     prune_images()?;
     Ok(())
+}
+
+/// The base image for a `--build` run: the configured pin, or the newest
+/// OpenCode V2 release tag from the registry, falling back to the default
+/// when the registry can't be reached (the daily timer must not hard-fail).
+fn build_base_image(cfg: &config::Config) -> String {
+    build_base_image_with(cfg, registry::latest_base_image)
+}
+
+fn build_base_image_with(
+    cfg: &config::Config,
+    discover: impl Fn() -> Result<registry::Latest>,
+) -> String {
+    if let Some(pin) = &cfg.build.base_image {
+        println!("Using pinned base image {pin}");
+        return pin.clone();
+    }
+    match discover() {
+        Ok(latest) => {
+            if let Some(image) = latest.image {
+                println!("Newest OpenCode V2 release: {image}");
+                image
+            } else {
+                let reason = if latest.truncated {
+                    "registry tag list was cut off before it ended"
+                } else {
+                    "registry has no 2.x release tags"
+                };
+                eprintln!(
+                    "Warning: {reason}; using default {}. Pin one with [build] base_image.",
+                    config::DEFAULT_BASE_IMAGE
+                );
+                config::DEFAULT_BASE_IMAGE.to_string()
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "Warning: could not check the registry for the newest OpenCode V2 release ({err:#}); using default {}. Pin one with [build] base_image.",
+                config::DEFAULT_BASE_IMAGE
+            );
+            config::DEFAULT_BASE_IMAGE.to_string()
+        }
+    }
 }
 
 fn prune_images() -> Result<()> {
@@ -415,5 +461,69 @@ mod tests {
             opencode_command(None, &s(&["run", "--server", "http://x", "hello"])),
             s(&["run", "--server", "http://x", "hello"])
         );
+    }
+
+    #[test]
+    fn build_base_image_uses_pin_without_discovery() {
+        let config: config::Config = toml::from_str(
+            r#"
+[build]
+base_image = "ghcr.io/anomalyco/opencode:2.0.18"
+"#,
+        )
+        .unwrap();
+        let discovered = std::cell::Cell::new(false);
+        let image = build_base_image_with(&config, || {
+            discovered.set(true);
+            Ok(registry::Latest {
+                image: Some("ghcr.io/anomalyco/opencode:9.9.9".to_string()),
+                truncated: false,
+            })
+        });
+        assert_eq!(image, "ghcr.io/anomalyco/opencode:2.0.18");
+        assert!(!discovered.get());
+    }
+
+    #[test]
+    fn build_base_image_uses_discovered_when_unset() {
+        let config: config::Config = toml::from_str("").unwrap();
+        let image = build_base_image_with(&config, || {
+            Ok(registry::Latest {
+                image: Some("ghcr.io/anomalyco/opencode:2.0.19".to_string()),
+                truncated: false,
+            })
+        });
+        assert_eq!(image, "ghcr.io/anomalyco/opencode:2.0.19");
+    }
+
+    #[test]
+    fn build_base_image_falls_back_when_registry_has_no_v2_tags() {
+        let config: config::Config = toml::from_str("").unwrap();
+        let image = build_base_image_with(&config, || {
+            Ok(registry::Latest {
+                image: None,
+                truncated: false,
+            })
+        });
+        assert_eq!(image, config::DEFAULT_BASE_IMAGE);
+    }
+
+    #[test]
+    fn build_base_image_falls_back_when_tag_list_truncated() {
+        let config: config::Config = toml::from_str("").unwrap();
+        let image = build_base_image_with(&config, || {
+            Ok(registry::Latest {
+                image: None,
+                truncated: true,
+            })
+        });
+        assert_eq!(image, config::DEFAULT_BASE_IMAGE);
+    }
+
+    #[test]
+    fn build_base_image_falls_back_when_registry_unreachable() {
+        let config: config::Config = toml::from_str("").unwrap();
+        let image = build_base_image_with(&config, || Err(anyhow!("registry unreachable")));
+        assert_eq!(image, config::DEFAULT_BASE_IMAGE);
     }
 }

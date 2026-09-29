@@ -1,6 +1,9 @@
 # Keep the default in sync with `DEFAULT_BASE_IMAGE` in src/config.rs.
-# The `latest` tag still tracks the V1 release, so pin an explicit V2 tag.
-ARG BASE_IMAGE=ghcr.io/anomalyco/opencode:2.0.18
+# Used only when building this Dockerfile directly: `opencode-docker --build`
+# overrides it via --build-arg, auto-tracking the newest V2 release when
+# [build] base_image is unset. The `latest` tag still tracks the V1 release,
+# so always pin an explicit V2 tag here.
+ARG BASE_IMAGE=ghcr.io/anomalyco/opencode:2.0.19
 ARG INCLUDE_R=false
 ARG INCLUDE_RUST=false
 
