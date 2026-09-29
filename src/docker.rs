@@ -683,11 +683,22 @@ mod tests {
             assert!(content.contains(rule), "missing seeded rule: {rule}");
         }
         let opencode_ask = "{ \"action\": \"external_directory\", \"resource\": \"/opencode/*\", \"effect\": \"ask\" }";
-        let cargo_allow = "{ \"action\": \"external_directory\", \"resource\": \"/opencode/cargo/*\", \"effect\": \"allow\" }";
-        assert!(
-            content.find(opencode_ask).unwrap() < content.find(cargo_allow).unwrap(),
-            "the /opencode/* ask rule must precede the /opencode/cargo/* allowance (last match wins)"
-        );
+        let ask_at = content
+            .find(opencode_ask)
+            .expect("seeded /opencode/* ask rule");
+        for rule in [
+            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/cargo/*\", \"effect\": \"allow\" }",
+            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/cache/R/*\", \"effect\": \"allow\" }",
+            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/data/R/*\", \"effect\": \"allow\" }",
+            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/config/R/*\", \"effect\": \"allow\" }",
+            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/state/R/*\", \"effect\": \"allow\" }",
+            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/cache/opencode/*\", \"effect\": \"allow\" }",
+        ] {
+            assert!(
+                ask_at < content.find(rule).expect("seeded feature-home allow rule"),
+                "the /opencode/* ask rule must precede every feature-home allowance (last match wins): {rule}"
+            );
+        }
     }
 
     #[test]
