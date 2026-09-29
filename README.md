@@ -114,6 +114,9 @@ Moving to V2:
 Agents run under a locked-down, opinionated permission policy. It lives in the host's `~/.config/opencode/opencode.json(c)`;
 there is no project-level config by default. If no opencode config file exists, the first run seeds the default policy
 (kept in `docker/opencode.jsonc.template`) host-side before starting the container — existing configs are never rewritten.
+If you upgraded from an older opencode-docker (or opencode itself created a bare `$schema`-only config), your live config
+may predate the seeded policy; replace it with `docker/opencode.jsonc.template` (keeping your model/agent settings) or
+delete the config files so the next run re-seeds.
 
 What the default policy does:
 
@@ -122,6 +125,12 @@ What the default policy does:
   `/etc/shadow`'s root-only mode still apply). Credential files (`auth.json`, `account.json`, `service.json`) are
   denied to the agent's tools outright; the session database, your git config under `/opencode/config/git`, and
   `*.env*` files keep prompting. (opencode reads its own global config directory without prompting.)
+- **Tool writes outside the workspace need the seeded rules.** The `write`/`edit`/`patch` tools require an
+  `external_directory` allowance for any path outside the active Location before an edit is approved — including the
+  container's writable tmpfs. The default policy allows `/workspace/*` and `/tmp/*`; opencode's own scratch dir
+  (`/tmp/opencode`) is always allowed by its base defaults. Without those rules the base policy's
+  `external_directory * -> ask` applies, and headless agents (subagents, `opencode run`) are blocked instead of
+  prompted.
 - **Agents can never modify their own setup.** Every existing global config file (`opencode.jsonc`, `opencode.json`,
   `config.json` — opencode merges all of them) is bind-mounted **read-only** into the container, so even a compromised
   agent cannot rewrite its permissions, and hard `deny` policies (`experimental.policies`) block editing the config

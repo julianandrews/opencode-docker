@@ -649,6 +649,18 @@ mod tests {
         assert!(content.contains("\"permissions\""));
         assert!(content.contains("edit:/opencode/config/opencode/*"));
         assert!(content.contains("\"experimental\""));
+        // The agent's working surface outside the workspace: the write/edit
+        // tools require an `external_directory` allowance for any path beyond
+        // the active Location. Without the `/tmp/*` (and `/workspace/*`)
+        // rules, the base policy's `external_directory * -> ask` applies and
+        // headless agents get blocked writing scratch files (regression:
+        // agents blocked from writing to /tmp).
+        assert!(content.contains(
+            "{ \"action\": \"external_directory\", \"resource\": \"/workspace/*\", \"effect\": \"allow\" }"
+        ));
+        assert!(content.contains(
+            "{ \"action\": \"external_directory\", \"resource\": \"/tmp/*\", \"effect\": \"allow\" }"
+        ));
     }
 
     #[test]
