@@ -122,26 +122,24 @@ What the default policy does:
 
 - **Reads are quiet for system paths.** The container rootfs is a read-only, ephemeral image with no host data, so
   `/etc`, `/usr`, `/bin`, `/sbin`, `/lib`, `/opt`, `/var` etc. can be read without prompting (OS-level protections like
-  `/etc/shadow`'s root-only mode still apply). Credential files (`auth.json`, `account.json`, `service.json`) are
-  denied to the agent's tools outright; the session database, your git config under `/opencode/config/git`, and
-  `*.env*` files keep prompting. (opencode reads its own global config directory without prompting.)
-- **Tool writes outside the workspace need the seeded rules.** The `write`/`edit`/`patch` tools require an
-  `external_directory` allowance for any path outside the active Location before an edit is approved — including the
-  container's writable tmpfs. The default policy allows `/workspace/*` and `/tmp/*`; opencode's own scratch dir
-  (`/tmp/opencode`) is allowed by its base defaults unless a rule overrides it. Without those rules the base policy's
-  `external_directory * -> ask` applies, and headless agents (subagents, `opencode run`) are blocked instead of
-  prompted.
-- **Feature toolchain homes stay quiet.** The shared tool homes used by the Rust/R features — the `CARGO_HOME` build
-  cache at `/opencode/cargo` (registry index, crate sources), R's XDG dirs (`/opencode/cache/R`, `/opencode/data/R`,
-  `/opencode/config/R`, `/opencode/state/R`), and opencode's own `/opencode/cache/opencode` — are allowed without
-  prompting: agents read and write them during builds, and they hold nothing sensitive except cargo's credential
-  files, reads of which still prompt (`credentials`, `credentials.toml`).
+  `/etc/shadow`'s root-only mode still apply). Real secrets are never asked about: credential files (`auth.json`,
+  `account.json`, `service.json` in the config and state dirs, cargo's `credentials*`, and the host git config under
+  `/opencode/config/git`, which can embed tokens in `insteadOf` URLs or `http.extraheader`) and the session database
+  are denied to the agent's tools outright by `experimental.policies`, and `*.env*` files keep prompting (opencode's
+  base policy). (opencode reads its own global config directory without prompting.)
+- **Tool reads and writes never prompt.** The seed replaces the base policy's `external_directory * -> ask` with a
+  single catch-all `external_directory * -> allow`, covering the workspace, the tmpfs `/tmp`, the feature-toolchain
+  homes and opencode's own dirs alike (`*` matches across `/`). Without it, headless agents (subagents,
+  `opencode run`) are blocked instead of prompted on every external path. The toolchain homes (`CARGO_HOME` registry
+  index and crate sources, R's XDG dirs, `/opencode/cache/opencode`) are build cache and need no per-path rules.
+- **Plan mode keeps its scratch.** The built-in `plan` agent denies all edits except opencode plan files; the seed
+  re-allows `edit /tmp/*` for that agent so plan mode can still write tmpfs scratch without touching persistent state.
 - **Agents can never modify their own setup.** Every existing global config file (`opencode.jsonc`, `opencode.json`,
   `config.json` — opencode merges all of them) is bind-mounted **read-only** into the container, so even a compromised
-  agent cannot rewrite its permissions, and hard `deny` policies (`experimental.policies`) block editing the config
-  directory, the recorded shell/tool-output archives, the session database and the credential files
-  `auth.json`/`account.json`/`service.json` (config and state dirs) regardless of any approval. Policies cannot be
-  overridden by project configs or "allow always" approvals.
+  agent cannot rewrite its permissions (in `--edit-config` runs those mounts are skipped by design — see below).
+  Hard `deny` policies (`experimental.policies`) additionally block tool reads/edits of the credential files, the
+  recorded shell/tool-output archives, `service.json` and the session database regardless of any approval. Policies
+  cannot be overridden by project configs or "allow always" approvals.
 - **Shell runs without prompting** (V2's allow-by-default base policy keeps the agent productive); only `git push` is
   always denied.
 

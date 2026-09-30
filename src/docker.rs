@@ -647,58 +647,60 @@ mod tests {
         assert!(mounts[0].starts_with(&dir.display().to_string()));
         let content = fs::read_to_string(dir.join("opencode.jsonc")).unwrap();
         assert!(content.contains("\"permissions\""));
-        assert!(content.contains("edit:/opencode/config/opencode/*"));
         assert!(content.contains("\"experimental\""));
-        // The agent's working surface outside the workspace: the write/edit
-        // tools require an `external_directory` allowance for any path beyond
-        // the active Location. The catch-all `*` rule is load-bearing (its
-        // removal re-blocks every external path), and the `/workspace/*` and
-        // `/tmp/*` rules are the explicit working-surface allowances; without
-        // the seeded rules the base policy's `external_directory * -> ask`
-        // applies and headless agents get blocked writing scratch files
-        // (regression: agents blocked from writing to /tmp).
-        assert!(content.contains(
-            "{ \"action\": \"external_directory\", \"resource\": \"*\", \"effect\": \"allow\" }"
-        ));
-        assert!(content.contains(
-            "{ \"action\": \"external_directory\", \"resource\": \"/workspace/*\", \"effect\": \"allow\" }"
-        ));
-        assert!(content.contains(
-            "{ \"action\": \"external_directory\", \"resource\": \"/tmp/*\", \"effect\": \"allow\" }"
-        ));
-        // Shared feature-toolchain homes (`CARGO_HOME`, R's XDG dirs) and
-        // opencode's cache are build cache, not secrets: the seed allows them
-        // so builds don't prompt. The `/opencode/*` ask rule must stay
-        // *before* these allowances (last match wins), and cargo's credential
-        // files keep prompting like the `*.env` rules.
+        // The seed is deliberately minimal: the V2 base policy already allows
+        // everything by default (asking only for external directories and
+        // `.env` reads), so on top of it the seed ships two global rules and
+        // one plan-agent exception. The catch-all `*` rule is load-bearing:
+        // without it the base policy's `external_directory * -> ask` applies
+        // and headless agents get blocked on every external path, including
+        // the tmpfs `/tmp` scratch (regression: agents blocked writing /tmp).
         for rule in [
-            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/cargo/*\", \"effect\": \"allow\" }",
-            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/cache/R/*\", \"effect\": \"allow\" }",
-            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/data/R/*\", \"effect\": \"allow\" }",
-            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/config/R/*\", \"effect\": \"allow\" }",
-            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/state/R/*\", \"effect\": \"allow\" }",
-            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/cache/opencode/*\", \"effect\": \"allow\" }",
-            "{ \"action\": \"read\", \"resource\": \"/opencode/cargo/credentials*\", \"effect\": \"ask\" }",
+            "{ \"action\": \"shell\", \"resource\": \"git push *\", \"effect\": \"deny\" }",
+            "{ \"action\": \"external_directory\", \"resource\": \"*\", \"effect\": \"allow\" }",
+            "{ \"action\": \"edit\", \"resource\": \"/tmp/*\", \"effect\": \"allow\" }",
         ] {
             assert!(content.contains(rule), "missing seeded rule: {rule}");
         }
-        let opencode_ask = "{ \"action\": \"external_directory\", \"resource\": \"/opencode/*\", \"effect\": \"ask\" }";
-        let ask_at = content
-            .find(opencode_ask)
-            .expect("seeded /opencode/* ask rule");
+        // The old per-path allowances are gone: `*` matches across `/`, so the
+        // catch-all covers the workspace, /tmp, the feature-toolchain homes
+        // (`CARGO_HOME`, R's XDG dirs) and opencode's own dirs alike. Keeping
+        // the stale rules would invite edits that re-break that contract.
         for rule in [
-            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/cargo/*\", \"effect\": \"allow\" }",
-            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/cache/R/*\", \"effect\": \"allow\" }",
-            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/data/R/*\", \"effect\": \"allow\" }",
-            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/config/R/*\", \"effect\": \"allow\" }",
-            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/state/R/*\", \"effect\": \"allow\" }",
-            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/cache/opencode/*\", \"effect\": \"allow\" }",
+            "{ \"action\": \"external_directory\", \"resource\": \"/workspace/*\", \"effect\": \"allow\" }",
+            "{ \"action\": \"external_directory\", \"resource\": \"/tmp/*\", \"effect\": \"allow\" }",
+            "{ \"action\": \"external_directory\", \"resource\": \"/opencode/*\", \"effect\": \"ask\" }",
+            "{ \"action\": \"read\", \"resource\": \"*.env\", \"effect\": \"ask\" }",
+            "{ \"action\": \"read\", \"resource\": \"/opencode/cargo/credentials*\", \"effect\": \"ask\" }",
         ] {
-            assert!(
-                ask_at < content.find(rule).expect("seeded feature-home allow rule"),
-                "the /opencode/* ask rule must precede every feature-home allowance (last match wins): {rule}"
-            );
+            assert!(!content.contains(rule), "stale seeded rule still present: {rule}");
         }
+        // Policies are the hard-deny layer: tool access to every host secret
+        // and to opencode's own state is denied outright, and policies cannot
+        // be lifted by project configs or saved approvals. Cargo's credential
+        // files and the session DB are read-denied too, not just asked about.
+        for rule in [
+            "{ \"action\": \"permission\", \"resource\": \"edit:/opencode/data/opencode/auth.json\", \"effect\": \"deny\" }",
+            "{ \"action\": \"permission\", \"resource\": \"read:/opencode/data/opencode/auth.json\", \"effect\": \"deny\" }",
+            "{ \"action\": \"permission\", \"resource\": \"edit:/opencode/data/opencode/account.json\", \"effect\": \"deny\" }",
+            "{ \"action\": \"permission\", \"resource\": \"read:/opencode/data/opencode/account.json\", \"effect\": \"deny\" }",
+            "{ \"action\": \"permission\", \"resource\": \"edit:/opencode/config/opencode/service.json\", \"effect\": \"deny\" }",
+            "{ \"action\": \"permission\", \"resource\": \"read:/opencode/config/opencode/service.json\", \"effect\": \"deny\" }",
+            "{ \"action\": \"permission\", \"resource\": \"edit:/opencode/state/opencode/service.json\", \"effect\": \"deny\" }",
+            "{ \"action\": \"permission\", \"resource\": \"read:/opencode/state/opencode/service.json\", \"effect\": \"deny\" }",
+            "{ \"action\": \"permission\", \"resource\": \"read:/opencode/cargo/credentials*\", \"effect\": \"deny\" }",
+            "{ \"action\": \"permission\", \"resource\": \"read:/opencode/config/git/*\", \"effect\": \"deny\" }",
+            "{ \"action\": \"permission\", \"resource\": \"edit:/opencode/data/opencode/shell/*\", \"effect\": \"deny\" }",
+            "{ \"action\": \"permission\", \"resource\": \"edit:/opencode/data/opencode/tool-output/*\", \"effect\": \"deny\" }",
+            "{ \"action\": \"permission\", \"resource\": \"edit:/opencode/data/opencode/opencode.db*\", \"effect\": \"deny\" }",
+            "{ \"action\": \"permission\", \"resource\": \"read:/opencode/data/opencode/opencode.db*\", \"effect\": \"deny\" }",
+        ] {
+            assert!(content.contains(rule), "missing seeded policy: {rule}");
+        }
+        // The broad config-dir edit policy is gone by design: the config files
+        // are read-only mounted in locked mode, so only `service.json` -- which
+        // must stay writable for the server -- keeps an explicit tripwire.
+        assert!(!content.contains("edit:/opencode/config/opencode/*"));
     }
 
     #[test]

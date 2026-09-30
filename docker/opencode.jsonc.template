@@ -2,67 +2,71 @@
   // Default OpenCode configuration seeded by opencode-docker on first run
   // (source of truth for src/docker.rs: DEFAULT_OPENCODE_CONFIG).
   //
-  // Edit this file on the HOST: inside the container it is bind-mounted
-  // read-only, so agents cannot change their own permissions or config, and
-  // the deny policies below survive any project-level config or approval.
+  // Edit this file on the HOST. In a normal (locked) run the config files,
+  // plugins dir, node_modules and package manifests are additionally mounted
+  // read-only, so an agent cannot change its own permissions or config even
+  // via shell. With --edit-config those mounts are skipped: this file is then
+  // tool-level guidance only, and the sandbox is the real security. The deny
+  // policies below survive any project-level config or approval either way.
   "$schema": "https://opencode.ai/config.json",
 
   // --- Permissions (V2 rules; ordered, last match wins) ---
-
-  // Shell: allow-by-default (V2 base policy) so the agent works without
-  // constant prompting; always block pushes.
+  //
+  // Minimal by design: the base policy already allows everything by default
+  // (prompting only for external directories and .env reads). Two rules
+  // change that: pushes to the host repo are always blocked (the workspace
+  // is host-mounted, so a push outlives the sandbox), and external-directory
+  // prompts are silenced -- the rootfs is an immutable ephemeral image, the
+  // toolchain caches are not secrets, and real credentials are hard-denied
+  // by policies below, never asked about.
   "permissions": [
     { "action": "shell", "resource": "git push *", "effect": "deny" },
-
-    // Reads: the container rootfs is a read-only, ephemeral image, so system
-    // paths (/etc, /usr, /bin, /sbin, /lib, /opt, /var, ...) are safe to read
-    // without prompting. Host-mounted credentials, your git config and the
-    // session database keep prompting (opencode reads its own config dir
-    // without prompting).
-    { "action": "external_directory", "resource": "*", "effect": "allow" },
-    { "action": "external_directory", "resource": "/opencode", "effect": "ask" },
-    { "action": "external_directory", "resource": "/opencode/*", "effect": "ask" },
-
-    // Shared feature-toolchain homes are build cache, not secrets: the Rust
-    // CARGO_HOME (registry index, crate sources) and R's XDG dirs (renv
-    // libraries, caches) are read and written during builds, so they stay
-    // quiet; opencode's own cache too. Cargo's credential files keep
-    // prompting (see the read rules below).
-    { "action": "external_directory", "resource": "/opencode/cargo/*", "effect": "allow" },
-    { "action": "external_directory", "resource": "/opencode/cache/R/*", "effect": "allow" },
-    { "action": "external_directory", "resource": "/opencode/data/R/*", "effect": "allow" },
-    { "action": "external_directory", "resource": "/opencode/config/R/*", "effect": "allow" },
-    { "action": "external_directory", "resource": "/opencode/state/R/*", "effect": "allow" },
-    { "action": "external_directory", "resource": "/opencode/cache/opencode/*", "effect": "allow" },
-
-    // The workspace mount and temp dirs are the agent's working surface.
-    { "action": "external_directory", "resource": "/workspace/*", "effect": "allow" },
-    { "action": "external_directory", "resource": "/tmp/*", "effect": "allow" },
-
-    // Credential-style files keep prompting (opencode's default; explicit here).
-    { "action": "read", "resource": "*.env", "effect": "ask" },
-    { "action": "read", "resource": "*.env.*", "effect": "ask" },
-    { "action": "read", "resource": "/opencode/cargo/credentials*", "effect": "ask" }
+    { "action": "external_directory", "resource": "*", "effect": "allow" }
   ],
 
+  // The plan agent denies edits except under ~/.opencode/plan. /tmp is
+  // ephemeral scratch (tmpfs in this image), so restoring edit access there
+  // keeps plan mode's "no persistent project changes" guarantee intact.
+  // Agent rules append after global rules, so this overrides the built-in
+  // deny for /tmp paths; the external_directory allow above covers the
+  // boundary check.
+  "agents": {
+    "plan": {
+      "permissions": [
+        { "action": "edit", "resource": "/tmp/*", "effect": "allow" }
+      ]
+    }
+  },
+
   // Policies are a hard-deny layer: they run after permission rules and saved
-  // "allow always" approvals, and project configs cannot lift them. Agents
-  // must never modify opencode's own configuration (including node_modules
-  // plugin installs), read/tamper credential files, rewrite the shell/tool
-  // output archives or the session database, or touch the service state.
+  // "allow always" approvals, and project configs cannot lift them. They
+  // guard host secrets and opencode's own state -- cargo registry and opencode
+  // auth credentials (auth.json, account.json, service.json), the host git
+  // config, the session database, and the shell/tool output archives -- from
+  // the agent's tools. All denies are silent, so this layer costs nothing in
+  // normal work.
   "experimental": {
     "policies": [
-      { "action": "permission", "resource": "edit:/opencode/config/opencode/*", "effect": "deny" },
       { "action": "permission", "resource": "edit:/opencode/data/opencode/auth.json", "effect": "deny" },
       { "action": "permission", "resource": "edit:/opencode/data/opencode/account.json", "effect": "deny" },
+      { "action": "permission", "resource": "edit:/opencode/config/opencode/service.json", "effect": "deny" },
       { "action": "permission", "resource": "read:/opencode/config/opencode/service.json", "effect": "deny" },
       { "action": "permission", "resource": "read:/opencode/data/opencode/auth.json", "effect": "deny" },
       { "action": "permission", "resource": "read:/opencode/data/opencode/account.json", "effect": "deny" },
+      // Cargo registry credentials (crates.io tokens) are host secrets: hard-
+      // deny their read instead of asking so they never reach the agent.
+      { "action": "permission", "resource": "read:/opencode/cargo/credentials*", "effect": "deny" },
+      // The host git config (ro-mounted at /opencode/config/git) can embed
+      // credentials (insteadOf URLs, http.extraheader headers): read-deny it.
+      { "action": "permission", "resource": "read:/opencode/config/git/*", "effect": "deny" },
       { "action": "permission", "resource": "edit:/opencode/data/opencode/shell/*", "effect": "deny" },
       { "action": "permission", "resource": "edit:/opencode/data/opencode/tool-output/*", "effect": "deny" },
       { "action": "permission", "resource": "read:/opencode/state/opencode/service.json", "effect": "deny" },
       { "action": "permission", "resource": "edit:/opencode/state/opencode/service.json", "effect": "deny" },
-      { "action": "permission", "resource": "edit:/opencode/data/opencode/opencode.db*", "effect": "deny" }
+      { "action": "permission", "resource": "edit:/opencode/data/opencode/opencode.db*", "effect": "deny" },
+      // Reading the session DB would pull every prior session into context:
+      // read-deny it too (shell access is unaffected).
+      { "action": "permission", "resource": "read:/opencode/data/opencode/opencode.db*", "effect": "deny" }
     ]
   }
 }
