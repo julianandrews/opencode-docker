@@ -6,6 +6,11 @@
 ARG BASE_IMAGE=ghcr.io/anomalyco/opencode:2.0.19
 ARG INCLUDE_R=false
 ARG INCLUDE_RUST=false
+# grpcurl is packaged for Alpine only in edge/testing, so it cannot come from
+# apk on a stable base; it is installed from the upstream release tarball below
+# instead. Pinned (unlike dbmate, which can use releases/latest) because the
+# asset name embeds the version, so bump this to update grpcurl.
+ARG GRPCURL_VERSION=1.9.4
 
 FROM ${BASE_IMAGE}
 
@@ -37,6 +42,32 @@ RUN apk add --no-cache bash curl jq git ffmpeg build-base protobuf tzdata \
     curl -fsSL -o /usr/local/bin/dbmate \
       https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-${DBMATE_ARCH} && \
     chmod +x /usr/local/bin/dbmate
+
+# Extra CLI tools every variant gets. Kept in their own layer, deliberately not
+# appended to the apk add above: that RUN also builds the R and Rust toolchains
+# (minutes of renv/rustup work), so adding a tool there would throw all of it
+# away and rebuild it on every variant. Version-checked at the end so a broken
+# download fails the build here rather than in the first agent session.
+#
+# ARG is declared here, immediately before its only consumer, rather than with
+# the other ARGs after FROM: every RUN following an ARG uses it implicitly as an
+# environment variable, so declaring it up there would make a GRPCURL_VERSION
+# bump invalidate the R/Rust RUN above and rebuild both toolchains -- exactly
+# what keeping this layer separate is meant to avoid.
+ARG GRPCURL_VERSION
+RUN apk add --no-cache openssl && \
+    ARCH=$(uname -m) && \
+    case $ARCH in \
+      x86_64) GRPCURL_ARCH=x86_64 ;; \
+      aarch64) GRPCURL_ARCH=arm64 ;; \
+      *) echo "Unsupported arch: $ARCH"; exit 1 ;; \
+    esac && \
+    curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/grpcurl.tgz \
+      "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_linux_${GRPCURL_ARCH}.tar.gz" && \
+    tar -xzf /tmp/grpcurl.tgz -C /usr/local/bin grpcurl && \
+    rm -f /tmp/grpcurl.tgz && \
+    grpcurl --version && \
+    openssl version
 
 ENV PATH=/usr/local/cargo/bin:$PATH \
     RUSTUP_HOME=/usr/local/rustup \

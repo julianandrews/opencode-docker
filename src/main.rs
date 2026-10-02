@@ -431,6 +431,281 @@ mod tests {
         v.iter().map(|x| x.to_string()).collect()
     }
 
+    const GRPCURL_URL: &str = "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_linux_${GRPCURL_ARCH}.tar.gz";
+
+    /// `uname -m` label -> grpcurl release asset arch. Pairing matters, not just
+    /// presence: a swapped mapping still builds, but installs a binary for the
+    /// wrong CPU and fails the version-check at the end of the RUN.
+    const GRPCURL_ARCH_ARMS: [(&str, &str); 2] = [("x86_64", "x86_64"), ("aarch64", "arm64")];
+
+    /// The embedded Dockerfile is the contract for the CLI tools every variant
+    /// ships. grpcurl is packaged for Alpine only in edge/testing, so it has to
+    /// come from the version-pinned upstream release tarball (covering both
+    /// arches), and `openssl` needs its own apk package: `openssl-dev` provides
+    /// headers and pkgconfig only, so without it there is no `openssl` binary.
+    fn check_extra_tools(dockerfile: &str) -> Result<(), String> {
+        let (global, build) = dockerfile
+            .split_once("FROM ${BASE_IMAGE}")
+            .ok_or("Dockerfile must build FROM ${BASE_IMAGE}")?;
+        let build_lines: Vec<&str> = build.lines().collect();
+
+        // The release asset name embeds the version, so `releases/latest` (which
+        // dbmate can use) is not an option here and the default must be bumped
+        // by hand.
+        if !global.lines().any(|l| {
+            l.trim()
+                .strip_prefix("ARG GRPCURL_VERSION=")
+                .is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()))
+        }) {
+            return Err("ARG GRPCURL_VERSION needs a pinned default before FROM (bump it to update grpcurl)".into());
+        }
+
+        // Re-declared after FROM with no default (like INCLUDE_R), or the RUN
+        // expands an empty version and fetches a 404 URL.
+        let declared_at = build_lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("ARG GRPCURL_VERSION"))
+            .ok_or("ARG GRPCURL_VERSION must be re-declared after FROM")?;
+
+        // apk cannot supply grpcurl on a stable base, so the upstream release
+        // tarball is what actually fetches the binary.
+        if !dockerfile.contains(GRPCURL_URL) {
+            return Err("grpcurl must be downloaded from its upstream release tarball".into());
+        }
+        if !dockerfile.contains("tar -xzf /tmp/grpcurl.tgz -C /usr/local/bin grpcurl") {
+            return Err("the grpcurl tarball must be extracted into /usr/local/bin".into());
+        }
+
+        // The case/label pairs, scoped to the RUN that consumes the ARG: the
+        // unrelated dbmate block below/above maps `uname -m` to *its* own arch
+        // vocabulary (amd64/arm64), so a whole-file scan would let dbmate's arms
+        // satisfy this check and miss a deleted grpcurl arm entirely.
+        // Case arms carry a trailing `\` continuation; compare the arm body only, so
+        // rewrapping the RUN does not read as a mapping change.
+        fn case_arm(line: &str) -> &str {
+            line.trim().trim_end_matches('\\').trim_end()
+        }
+
+        let arm_at = |label: &str| {
+            build_lines.iter().position(|l| {
+                let t = case_arm(l);
+                t.starts_with(&format!("{label}) GRPCURL_ARCH=")) && t.ends_with(";;")
+            })
+        };
+        let mut arms = Vec::new();
+        for (label, asset_arch) in GRPCURL_ARCH_ARMS {
+            match arm_at(label) {
+                None => return Err(format!("grpcurl install must map {label}")),
+                Some(line) => {
+                    let got = case_arm(build_lines[line]);
+                    let want = format!("{label}) GRPCURL_ARCH={asset_arch} ;;");
+                    if got != want {
+                        return Err(format!("grpcurl install must map `{want}`, found `{got}`"));
+                    }
+                    arms.push(line);
+                }
+            }
+        }
+        // Unsupported arches must abort the build, not silently fall through to
+        // an empty asset arch (which would 404 with a far less obvious message).
+        if !build_lines[arms[1] + 1..]
+            .iter()
+            .any(|l| l.trim_start().starts_with("*)"))
+        {
+            return Err("the grpcurl arch mapping must reject unsupported architectures".into());
+        }
+
+        // Declared immediately before its consumer: every RUN after an ARG uses
+        // it implicitly as an environment variable, so hoisting this next to
+        // INCLUDE_R would make a version bump invalidate the expensive R/Rust
+        // RUN above -- the one cost this layer exists to avoid paying.
+        let run_at = build_lines
+            .iter()
+            .position(|l| l.contains("apk add --no-cache openssl"))
+            .ok_or("the extra-tools RUN must install the openssl package")?;
+        if declared_at + 1 != run_at {
+            return Err(format!(
+                "ARG GRPCURL_VERSION must be declared immediately before the extra-tools RUN, \
+                 but it is {run_at} lines away from it: a version bump would then invalidate \
+                 the R/Rust RUN too, which is what this separate layer avoids"
+            ));
+        }
+
+        // A broken or partial download must fail the build here rather than in
+        // the first agent session.
+        for check in ["grpcurl --version", "openssl version"] {
+            if !dockerfile.contains(check) {
+                return Err(format!("the build should end by running `{check}`"));
+            }
+        }
+        // Token-exact, so the already-present `openssl-dev` cannot satisfy this.
+        if !apk_add_has_package(dockerfile, "openssl") {
+            return Err(
+                "openssl must be added as its own apk package (openssl-dev ships no CLI)".into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Token-exact `apk add` membership, so `openssl-dev` never counts as
+    /// `openssl`.
+    fn apk_add_has_package(dockerfile: &str, pkg: &str) -> bool {
+        dockerfile.lines().any(|line| {
+            let words: Vec<_> = line.split_whitespace().filter(|w| *w != "RUN").collect();
+            words.starts_with(&["apk", "add"]) && words.contains(&pkg)
+        })
+    }
+
+    #[test]
+    fn dockerfile_ships_grpcurl_and_openssl() {
+        check_extra_tools(include_str!("../docker/Dockerfile")).unwrap();
+    }
+
+    /// An assertion set that only ever passes proves nothing. Re-run
+    /// `check_extra_tools` against deliberately broken copies of the real
+    /// Dockerfile so each invariant is known to still bite. Every mutation is
+    /// derived from the current file (never a hardcoded version or line), so
+    /// bumping `GRPCURL_VERSION` -- the documented maintenance step -- keeps
+    /// this test green instead of failing on an intended change.
+    #[test]
+    fn extra_tools_contract_detects_regressions() {
+        // Apply `edit` to the Dockerfile's lines and rejoin, preserving the
+        // trailing newline so the result stays a valid Dockerfile.
+        fn mutate(text: &str, edit: impl FnOnce(&mut Vec<String>)) -> String {
+            let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+            edit(&mut lines);
+            let mut out = lines.join("\n");
+            if text.ends_with('\n') {
+                out.push('\n');
+            }
+            out
+        }
+        // Case arms carry a trailing `\` continuation; compare the arm body only, so
+        // rewrapping the RUN does not read as a mapping change.
+        fn case_arm(line: &str) -> &str {
+            line.trim().trim_end_matches('\\').trim_end()
+        }
+
+        // Match on the arm body so the trailing `\` continuation does not have
+        // to be spelled out in every fixture string.
+        let find = |lines: &[String], needle: &str| {
+            lines
+                .iter()
+                .position(|l| case_arm(l) == needle)
+                .unwrap_or_else(|| panic!("fixture line not found: {needle}"))
+        };
+
+        let original = include_str!("../docker/Dockerfile");
+        let mutations: Vec<(&str, String)> = vec![
+            // Losing the re-declaration is the easiest slip when editing the
+            // ARG block, and it surfaces only as a 404 at build time.
+            (
+                "no post-FROM ARG",
+                mutate(original, |l| {
+                    l.remove(find(l, "ARG GRPCURL_VERSION"));
+                }),
+            ),
+            // An unversioned ARG would silently disable the pin. Matches the
+            // declaration generically so bumping the pin stays a no-op here.
+            (
+                "unpinned ARG",
+                mutate(original, |l| {
+                    let at = l
+                        .iter()
+                        .position(|x| x.trim_start().starts_with("ARG GRPCURL_VERSION="))
+                        .expect("fixture: pre-FROM GRPCURL_VERSION default");
+                    l[at] = "ARG GRPCURL_VERSION=".into();
+                }),
+            ),
+            // The cache bug this contract now guards: hoisting the ARG up with
+            // the others is a tidy-looking edit that silently re-couples a
+            // version bump to the R/Rust rebuild.
+            (
+                "ARG hoisted away from its consumer",
+                mutate(original, |l| {
+                    let at = find(l, "ARG GRPCURL_VERSION");
+                    let arg = l.remove(at);
+                    let after_include = find(l, "ARG INCLUDE_RUST");
+                    l.insert(after_include + 1, arg);
+                }),
+            ),
+            // Dropping one arch arm breaks that platform only.
+            (
+                "x86_64 arm removed",
+                mutate(original, |l| {
+                    l.remove(find(l, "x86_64) GRPCURL_ARCH=x86_64 ;;"));
+                }),
+            ),
+            (
+                "arm64 arm removed",
+                mutate(original, |l| {
+                    l.remove(find(l, "aarch64) GRPCURL_ARCH=arm64 ;;"));
+                }),
+            ),
+            // Both arms present but paired wrongly: builds fine on one arch,
+            // installs an unrunnable binary on the other.
+            (
+                "arch labels swapped",
+                mutate(original, |l| {
+                    let a = find(l, "x86_64) GRPCURL_ARCH=x86_64 ;;");
+                    l[a] = l[a].replace("GRPCURL_ARCH=x86_64", "GRPCURL_ARCH=arm64");
+                    let b = find(l, "aarch64) GRPCURL_ARCH=arm64 ;;");
+                    l[b] = l[b].replace("GRPCURL_ARCH=arm64", "GRPCURL_ARCH=x86_64");
+                }),
+            ),
+            // The dbmate case block has a byte-identical `*)` arm, so this
+            // deletes the one that actually follows the grpcurl arms.
+            (
+                "grpcurl unsupported-arch arm removed",
+                mutate(original, |l| {
+                    let arm = find(l, "aarch64) GRPCURL_ARCH=arm64 ;;");
+                    // Guard the fixture itself: the dbmate block has a
+                    // byte-identical `*)` arm earlier in the file.
+                    assert!(
+                        case_arm(&l[arm + 1])
+                            .starts_with(r#"*) echo "Unsupported arch: $ARCH"; exit 1 ;;"#),
+                        "unexpected arm after the grpcurl case: {}",
+                        case_arm(&l[arm + 1])
+                    );
+                    l.remove(arm + 1);
+                }),
+            ),
+            // Swapping to an apk-only install is the mistake this contract
+            // exists to catch: grpcurl is not packaged for stable Alpine.
+            ("tarball URL removed", original.replace(GRPCURL_URL, "")),
+            (
+                "tarball extraction removed",
+                original.replace(
+                    "tar -xzf /tmp/grpcurl.tgz -C /usr/local/bin grpcurl",
+                    "true",
+                ),
+            ),
+            // Without the version-check a bad download only fails later, in an
+            // agent session.
+            (
+                "grpcurl version-check removed",
+                original.replace("grpcurl --version && \\\n", ""),
+            ),
+            (
+                "openssl version-check removed",
+                original.replace("openssl version", "true"),
+            ),
+            // `openssl-dev` is already there, so a substring check would pass.
+            (
+                "openssl CLI package removed",
+                original.replace("apk add --no-cache openssl && \\", ""),
+            ),
+        ];
+
+        for (name, mutated) in mutations {
+            assert_ne!(mutated, original, "mutation '{name}' changed nothing");
+            assert!(
+                check_extra_tools(&mutated).is_err(),
+                "mutation '{name}' slipped past the contract check"
+            );
+        }
+    }
+
     #[test]
     fn tui_default_gets_standalone() {
         assert_eq!(opencode_command(None, &s(&[])), s(&["--standalone"]));
