@@ -43,11 +43,15 @@ RUN apk add --no-cache bash curl jq git ffmpeg build-base protobuf tzdata \
       https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-${DBMATE_ARCH} && \
     chmod +x /usr/local/bin/dbmate
 
-# Extra CLI tools every variant gets. Kept in their own layer, deliberately not
-# appended to the apk add above: that RUN also builds the R and Rust toolchains
-# (minutes of renv/rustup work), so adding a tool there would throw all of it
-# away and rebuild it on every variant. Version-checked at the end so a broken
-# download fails the build here rather than in the first agent session.
+# Extra tools every variant gets: openssl (the CLI -- openssl-dev in the layer
+# above ships headers only), the openssh client (ssh-keygen and friends, for
+# generating dev host keys), and py3-paramiko (the `paramiko` module, from
+# Alpine's own build so it matches the image's python3). Kept in their own
+# layer, deliberately not appended to the apk add above: that RUN also builds
+# the R and Rust toolchains (minutes of renv/rustup work), so adding a tool
+# there would throw all of it away and rebuild it on every variant. The RUN ends
+# by running each tool, so a broken download or a package that does not actually
+# import fails the build here rather than in the first agent session.
 #
 # ARG is declared here, immediately before its only consumer, rather than with
 # the other ARGs after FROM: every RUN following an ARG uses it implicitly as an
@@ -55,7 +59,7 @@ RUN apk add --no-cache bash curl jq git ffmpeg build-base protobuf tzdata \
 # bump invalidate the R/Rust RUN above and rebuild both toolchains -- exactly
 # what keeping this layer separate is meant to avoid.
 ARG GRPCURL_VERSION
-RUN apk add --no-cache openssl && \
+RUN apk add --no-cache openssl openssh-client py3-paramiko && \
     ARCH=$(uname -m) && \
     case $ARCH in \
       x86_64) GRPCURL_ARCH=x86_64 ;; \
@@ -67,7 +71,9 @@ RUN apk add --no-cache openssl && \
     tar -xzf /tmp/grpcurl.tgz -C /usr/local/bin grpcurl && \
     rm -f /tmp/grpcurl.tgz && \
     grpcurl --version && \
-    openssl version
+    openssl version && \
+    ssh -V && \
+    python3 -c 'import paramiko'
 
 ENV PATH=/usr/local/cargo/bin:$PATH \
     RUSTUP_HOME=/usr/local/rustup \

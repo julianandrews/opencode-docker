@@ -531,18 +531,32 @@ mod tests {
             ));
         }
 
-        // A broken or partial download must fail the build here rather than in
+        // A broken or partial install must fail the build here rather than in
         // the first agent session.
-        for check in ["grpcurl --version", "openssl version"] {
+        for check in [
+            "grpcurl --version",
+            "openssl version",
+            "ssh -V",
+            "import paramiko",
+        ] {
             if !dockerfile.contains(check) {
-                return Err(format!("the build should end by running `{check}`"));
+                return Err(format!("the build should end by checking `{check}`"));
             }
         }
-        // Token-exact, so the already-present `openssl-dev` cannot satisfy this.
+        // Token-exact, so the already-present `openssl-dev` cannot satisfy the
+        // openssl requirement.
         if !apk_add_has_package(dockerfile, "openssl") {
             return Err(
                 "openssl must be added as its own apk package (openssl-dev ships no CLI)".into(),
             );
+        }
+        // openssh-client resolves to openssh-client-default, which is where
+        // ssh-keygen comes from; py3-paramiko is Alpine's own build, so it
+        // matches the image's python3 instead of a pip one.
+        for pkg in ["openssh-client", "py3-paramiko"] {
+            if !apk_add_has_package(dockerfile, pkg) {
+                return Err(format!("{pkg} must be installed in the extra-tools layer"));
+            }
         }
         Ok(())
     }
@@ -557,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn dockerfile_ships_grpcurl_and_openssl() {
+    fn dockerfile_ships_extra_tools() {
         check_extra_tools(include_str!("../docker/Dockerfile")).unwrap();
     }
 
@@ -593,6 +607,19 @@ mod tests {
                 .iter()
                 .position(|l| case_arm(l) == needle)
                 .unwrap_or_else(|| panic!("fixture line not found: {needle}"))
+        };
+        // The extra-tools layer's `apk add` line, for dropping one package.
+        let apk_line = |lines: &[String]| {
+            lines
+                .iter()
+                .position(|l| l.contains("apk add --no-cache openssl"))
+                .expect("fixture: extra-tools apk add line")
+        };
+        let drop_apk_pkg = |text: &str, pkg: &str| {
+            mutate(text, |l| {
+                let at = apk_line(l);
+                l[at] = l[at].replacen(&format!(" {pkg}"), "", 1);
+            })
         };
 
         let original = include_str!("../docker/Dockerfile");
@@ -680,20 +707,36 @@ mod tests {
                     "true",
                 ),
             ),
-            // Without the version-check a bad download only fails later, in an
-            // agent session.
+            // Without the smoke checks a bad download or a broken Python
+            // package only fails later, in an agent session.
             (
                 "grpcurl version-check removed",
                 original.replace("grpcurl --version && \\\n", ""),
             ),
             (
                 "openssl version-check removed",
-                original.replace("openssl version", "true"),
+                original.replace("openssl version && \\\n", ""),
+            ),
+            (
+                "ssh version-check removed",
+                original.replace("ssh -V && \\\n", ""),
+            ),
+            (
+                "paramiko import check removed",
+                original.replace("python3 -c 'import paramiko'", "true"),
             ),
             // `openssl-dev` is already there, so a substring check would pass.
             (
                 "openssl CLI package removed",
-                original.replace("apk add --no-cache openssl && \\", ""),
+                drop_apk_pkg(original, "openssl"),
+            ),
+            (
+                "openssh-client package removed",
+                drop_apk_pkg(original, "openssh-client"),
+            ),
+            (
+                "py3-paramiko package removed",
+                drop_apk_pkg(original, "py3-paramiko"),
             ),
         ];
 
