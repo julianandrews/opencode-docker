@@ -92,6 +92,20 @@ the setup and runtime containers. It is the persistent library for R projects wi
 installs survive across runs, since the container `HOME` is ephemeral) and the fallback target for `renv.lock`
 projects that do not activate renv.
 
+## The container user
+
+Every run uses `docker run --user <host uid>:<host gid>`, so files the agent creates in the workspace are owned by you
+on the host. The image is Alpine and the base image only knows root plus system accounts, so the variant builds create a
+passwd/group entry for your host UID via the `USER_ID`/`USER_GID` build args. Without that entry, any OpenSSH tool dies at
+startup with `No user exists for uid <uid>`: `ssh-keygen` calls `getpwuid(getuid())` before parsing its arguments, so even
+`ssh-keygen -f /tmp/k` fails. That entry's home is `/opencode/home`; it is mounted writable and `HOME` points at it, so
+`~/.ssh` (and anything else user-scoped) is writable and persists across runs despite `--read-only`. Host side it lives at
+`~/.local/share/opencode-docker/home`.
+
+Because the image tag does not encode the UID, each image is stamped with an `org.opencode-docker.user-ids` label and
+`ensure_image` rebuilds it when the label is missing or does not match the current host user (e.g. after changing UID).
+Rebuild the variants with `opencode-docker --build`, or just start a run and let it rebuild once.
+
 ## OpenCode V2
 
 Runs use the OpenCode V2 release, auto-tracked by `--build` (fallback default `2.0.19`, or pin with `[build] base_image`).

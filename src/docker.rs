@@ -86,6 +86,7 @@ impl DockerArgs {
             data.join("opentui"),
             state.join("opencode"),
             data.join("opencode-docker/r-library"),
+            data.join("opencode-docker/home"),
         ];
         for dir in &dirs_to_create {
             let _ = std::fs::create_dir_all(dir);
@@ -95,6 +96,18 @@ impl DockerArgs {
             self.args.push("-e".into());
             self.args.push(format!("{}={}", name, value));
         }
+        // A writable, persistent home for the runtime user. The image bakes a
+        // passwd entry matching the host UID (see the Dockerfile), whose home
+        // is /opencode/home; mounting it here keeps `~/.ssh` and other
+        // user-scoped files writable across runs despite `--read-only`. This
+        // is what lets ssh-keygen save its default ~/.ssh/id_* path.
+        self.args.push("-e".into());
+        self.args.push("HOME=/opencode/home".into());
+        self.args.push("-v".into());
+        self.args.push(format!(
+            "{}:/opencode/home",
+            data.join("opencode-docker/home").display()
+        ));
         self.args.push("-v".into());
         self.args.push(format!(
             "{}:/opencode/config/opencode",
@@ -537,6 +550,26 @@ mod tests {
         assert!(args.contains(&"/tmp:exec".to_string()));
         assert!(args.contains(&"host.docker.internal:host-gateway".to_string()));
         assert!(args.contains(&"/etc/localtime:/etc/localtime:ro".to_string()));
+    }
+
+    #[test]
+    fn xdg_dirs_mounts_writable_home_for_runtime_user() {
+        // The image bakes a passwd entry whose home is /opencode/home; it must
+        // be mounted writable (the rootfs is read-only) and HOME pointed at it,
+        // or ssh-keygen's default ~/.ssh write fails after the passwd fix.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut da = DockerArgs::new();
+        da.xdg_dirs(tmp.path(), false).unwrap();
+        let args = da.into_vec();
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-e".to_string(), "HOME=/opencode/home".to_string()]),
+            "HOME=/opencode/home missing: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a.ends_with(":/opencode/home")),
+            "home mount missing: {args:?}"
+        );
     }
 
     #[test]

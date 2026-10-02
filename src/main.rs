@@ -391,12 +391,55 @@ fn image_exists(name: &str) -> Result<bool> {
 
 fn ensure_image(name: &str, features: &[Feature], base_image: &str) -> Result<()> {
     if image_exists(name)? {
-        return Ok(());
+        // The tag does not encode the runtime UID, so an image built for a
+        // different host user (e.g. the host UID changed, or a shared image
+        // cache) would silently start with the wrong passwd entry. The build
+        // stamps the UID/GID into a label; rebuild when it is missing or
+        // stale.
+        if image_user_ids(name)? == Some(current_user_ids()) {
+            return Ok(());
+        }
+        eprintln!(
+            "Image '{name}' was built for a different user; rebuilding it for UID:GID {}.",
+            current_user_ids()
+        );
+        return build_variant(features, name, base_image, false);
     }
     eprintln!(
         "Image '{name}' not found locally; building it now (pre-build it with `opencode-docker --build` or the systemd timer to keep startups instant)."
     );
     build_variant(features, name, base_image, false)
+}
+
+const USER_ID_LABEL: &str = "org.opencode-docker.user-ids";
+
+/// The `USER_ID:USER_GID` baked into the image, read from its label. `None`
+/// when the image or label is absent (an image predating the label, or a
+/// non-docker error); the caller then rebuilds.
+fn image_user_ids(name: &str) -> Result<Option<String>> {
+    let output = std::process::Command::new("docker")
+        .args([
+            "image",
+            "inspect",
+            "--format",
+            &format!(r#"{{{{index .Config.Labels "{USER_ID_LABEL}"}}}}"#),
+            name,
+        ])
+        .output()
+        .context("failed to run docker image inspect")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let label = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if label.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(label))
+    }
+}
+
+fn current_user_ids() -> String {
+    format!("{}:{}", util::uid(), util::gid())
 }
 
 fn build_variant(features: &[Feature], tag: &str, base_image: &str, pull: bool) -> Result<()> {
@@ -411,6 +454,12 @@ fn build_variant(features: &[Feature], tag: &str, base_image: &str, pull: bool) 
         cmd.arg("--pull");
     }
     cmd.args(["--build-arg", &format!("BASE_IMAGE={base_image}")]);
+    cmd.args(["--build-arg", &format!("USER_ID={}", util::uid())]);
+    cmd.args(["--build-arg", &format!("USER_GID={}", util::gid())]);
+    cmd.args([
+        "--label",
+        &format!("{USER_ID_LABEL}={}", current_user_ids()),
+    ]);
     if has_r {
         cmd.args(["--build-arg", "INCLUDE_R=true"]);
     }
@@ -568,6 +617,114 @@ mod tests {
             let words: Vec<_> = line.split_whitespace().filter(|w| *w != "RUN").collect();
             words.starts_with(&["apk", "add"]) && words.contains(&pkg)
         })
+    }
+
+    /// The runtime user contract. The container always runs as the host UID
+    /// (`docker run --user`), so the image must create a passwd entry for it --
+    /// otherwise ssh-keygen's `getpwuid(getuid())` fatal ("No user exists for
+    /// uid") makes ssh tools unusable. The entry's home must also be a real,
+    /// writable dir, since ssh-keygen builds its default key path from it.
+    fn check_runtime_user(dockerfile: &str) -> Result<(), String> {
+        let (_, build) = dockerfile
+            .split_once("FROM ${BASE_IMAGE}")
+            .ok_or("Dockerfile must build FROM ${BASE_IMAGE}")?;
+        let build_lines: Vec<&str> = build.lines().collect();
+
+        // Build args the CLI passes; without them the layer would always use
+        // the 1000 default and never match a different host UID.
+        for arg in ["ARG USER_ID", "ARG USER_GID"] {
+            if !build_lines.iter().any(|l| l.trim_start().starts_with(arg)) {
+                return Err(format!("{arg} must be declared after FROM"));
+            }
+        }
+
+        // The passwd/group creation plus the home directory. Match the
+        // load-bearing tokens, so rewrapping the RUN does not break the check.
+        let run = build_lines
+            .iter()
+            .position(|l| l.contains("adduser -D -u \"$USER_ID\""))
+            .ok_or("the runtime user must be created with adduser -u \"$USER_ID\"")?;
+        // The user-creation RUN is the one line that both creates the user and
+        // sets up the home; requiring both on the same logical RUN keeps them
+        // from drifting apart.
+        let run_block: String = build_lines[run..]
+            .iter()
+            .take_while(|l| {
+                // Stop at the ENV that follows, i.e. include continuations.
+                !l.trim_start().starts_with("ENV ")
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        for token in [
+            "/opencode/home",
+            "getent passwd \"$USER_ID\"",
+            "mkdir -p /opencode/home",
+            "chown \"$USER_ID:$USER_GID\" /opencode/home",
+        ] {
+            if !run_block.contains(token) {
+                return Err(format!("the runtime-user layer must contain `{token}`"));
+            }
+        }
+
+        // A build-time smoke check turns a broken user layer into a build
+        // failure instead of a first-session ssh-keygen crash. It must run as
+        // the new user (not root, which always exists), or it would pass even
+        // when the passwd entry is broken.
+        if !run_block.contains("su opencode -c 'ssh-keygen -t ed25519") {
+            return Err("the runtime-user layer must smoke-test ssh-keygen as the new user".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dockerfile_creates_runtime_user() {
+        check_runtime_user(include_str!("../docker/Dockerfile")).unwrap();
+    }
+
+    #[test]
+    fn image_user_ids_label_is_stable() {
+        // The label value must be the exact `uid:gid` string the label is set
+        // to at build time; `ensure_image` compares them verbatim.
+        assert_eq!(
+            current_user_ids(),
+            format!("{}:{}", util::uid(), util::gid())
+        );
+        assert!(!USER_ID_LABEL.is_empty());
+    }
+
+    #[test]
+    fn runtime_user_contract_detects_regressions() {
+        let original = include_str!("../docker/Dockerfile");
+        let mutations: Vec<(&str, String)> = vec![
+            (
+                "USER_ID arg removed",
+                original.replace("ARG USER_ID=1000", "ARG SOMETHING=1000"),
+            ),
+            (
+                "adduser removed",
+                original.replace("adduser -D -u \"$USER_ID\"", "true -D -u \"$USER_ID\""),
+            ),
+            (
+                "home chown removed",
+                original.replace("chown \"$USER_ID:$USER_GID\" /opencode/home", "true"),
+            ),
+            (
+                "smoke test removed",
+                original.replace("ssh-keygen -t ed25519", "true ssh-keygen"),
+            ),
+            (
+                "smoke test runs as root",
+                original.replace("su opencode -c 'ssh-keygen", "ssh-keygen"),
+            ),
+        ];
+        for (name, mutated) in mutations {
+            assert_ne!(mutated, original, "mutation '{name}' changed nothing");
+            assert!(
+                check_runtime_user(&mutated).is_err(),
+                "mutation '{name}' slipped past the contract check"
+            );
+        }
     }
 
     #[test]

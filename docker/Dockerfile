@@ -75,6 +75,37 @@ RUN apk add --no-cache openssl openssh-client py3-paramiko && \
     ssh -V && \
     python3 -c 'import paramiko'
 
+# Create a passwd entry matching the host UID/GID the container runs as
+# (`docker run --user <uid>:<gid>`). The base image is Alpine and only knows
+# root plus system accounts, so without this every ssh tool dies in
+# `getpwuid(getuid())` with "No user exists for uid <uid>" -- ssh-keygen does
+# this at the top of main(), before it even parses `-f`, so the failure cannot
+# be worked around on the command line. It also derives its default key path
+# from `pw->pw_dir`, so the home below must exist and be writable.
+#
+# Declared here, after the expensive R/Rust and extra-tools RUNs, so a UID
+# change (moving to a different host user) invalidates only this cheap layer
+# instead of rebuilding both toolchains. The CLI passes the host IDs as
+# --build-arg and stamps them into an image label so a stale image built for a
+# different UID can be detected and rebuilt (see ensure_image in src/main.rs).
+ARG USER_ID=1000
+ARG USER_GID=1000
+# Rare: the host UID collides with an existing account (root=0 or a system
+# user). Fail loudly rather than silently shipping a home/tools account that
+# does not match the runtime UID.
+RUN if getent passwd "$USER_ID" >/dev/null; then \
+        echo "Error: UID $USER_ID already exists in the image; pick a different host user" >&2; \
+        exit 1; \
+    fi && \
+    (addgroup -g "$USER_GID" opencode 2>/dev/null || true) && \
+    grp="$(getent group "$USER_GID" | cut -d: -f1)" && \
+    adduser -D -u "$USER_ID" -G "$grp" -h /opencode/home opencode && \
+    mkdir -p /opencode/home && \
+    chown "$USER_ID:$USER_GID" /opencode/home && \
+    getent passwd "$USER_ID" && \
+    su opencode -c 'ssh-keygen -t ed25519 -N "" -f /tmp/opencode-user-check -C "build check"' && \
+    rm -f /tmp/opencode-user-check /tmp/opencode-user-check.pub
+
 ENV PATH=/usr/local/cargo/bin:$PATH \
     RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo
