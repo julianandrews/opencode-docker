@@ -29,6 +29,37 @@ cargo build --release
 install -m755 target/release/opencode-docker ~/.local/bin/
 ```
 
+### Nix
+
+The flake exposes `packages.default` and a Home Manager module:
+
+```nix
+{
+  inputs.opencode-docker.url = "github:julianandrews/opencode-docker";
+}
+```
+
+```nix
+{
+  imports = [ inputs.opencode-docker.homeManagerModules.default ];
+
+  programs.opencode-docker = {
+    enable = true;
+
+    # Optional: rebuild the configured image variants daily with a user timer.
+    build.enable = true;
+    # build.calendar = "daily";
+  };
+}
+```
+
+`packages.default` wraps the CLI with `docker-client`, so user services do
+not depend on the host `PATH`. The module installs the package when either
+`programs.opencode-docker.enable` or `build.enable` is set. It does not manage
+`~/.config/opencode-docker/docker-profiles.toml`; keep that config and the
+OpenCode config under `~/.config/opencode` as usual. If you use rootless
+Docker, set `DOCKER_HOST` in the service environment as well as your session.
+
 ## Configuration
 
 `~/.config/opencode-docker/docker-profiles.toml`:
