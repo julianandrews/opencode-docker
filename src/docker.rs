@@ -115,42 +115,18 @@ impl DockerArgs {
         ));
         // Seed a default opencode config host-side when none exists yet (the
         // host-side creation keeps the bind mount owned by the host user, like
-        // the dirs above). By default all existing global config files, the
-        // plugins dir, node_modules and the package manifests are then
-        // additionally mounted read-only: an agent must never be able to
-        // rewrite its own permissions or persist code that auto-loads on the
-        // next launch. `--edit-config` drops these mounts so config and
-        // plugins can be edited in-container. cli.json/service.json stay
-        // writable for the TUI either way.
+        // the dirs above). Every existing config entry is then mounted
+        // read-only, except the runtime-writable regular files cli.json,
+        // service.json and tui.json. Symlinked entries are read-only even
+        // with `--edit-config`: they point into the Nix store, so a writable
+        // mount could never work, and skipping the mount would expose a
+        // dangling symlink inside the container. This is what lets Nix manage
+        // the server config, CLI settings, sounds, agents, commands and skills
+        // with ordinary Home Manager symlinks.
         let config_dir = config.join("opencode");
-        if edit_config {
-            let _ = seed_opencode_config(&config_dir);
-        } else {
-            for mount in opencode_config_mounts(&config_dir)? {
-                self.args.push("-v".into());
-                self.args.push(mount);
-            }
-            // opencode auto-discovers plugins dropped into its global plugins
-            // dir (any .ts/.js is loaded on the next launch), so the dir is
-            // mounted read-only: a writable plugins dir would let an agent
-            // persist arbitrary code in the host config dir. Plugin management
-            // therefore happens host-side. The mounts are only pushed when the
-            // host-side dirs exist: mounting a nonexistent source would make
-            // Docker create a root-owned directory in the user's config tree.
-            push_ro_dir_mount(self, &config_dir.join("plugins"), "plugins");
-            // Same for the npm plugin surface: node_modules and the package
-            // manifests are read-only in locked mode, so plugin packages can
-            // only be installed host-side (or in a --edit-config session).
-            // opencode never needs to write them at runtime; a plugin declared
-            // in config but not installed host-side just fails to auto-load.
-            push_ro_dir_mount(self, &config_dir.join("node_modules"), "node_modules");
-            for mount in existing_file_mounts(
-                &config_dir,
-                &["package.json", "package-lock.json", "bun.lock"],
-            ) {
-                self.args.push("-v".into());
-                self.args.push(mount);
-            }
+        for mount in opencode_config_mounts(&config_dir, edit_config)? {
+            self.args.push("-v".into());
+            self.args.push(mount);
         }
         self.args.push("-v".into());
         self.args.push(format!(
@@ -353,80 +329,92 @@ impl DockerArgs {
     }
 }
 
-/// Build the host-side read-only mounts for the global opencode config
-/// files, creating the default config on first run if none exists yet.
+/// Entries that stay writable for the runtime when they are regular files.
+/// A symlink with one of these names is mounted read-only instead: its target
+/// lives in the Nix store, where writes fail.
+const RUNTIME_WRITABLE_CONFIG: &[&str] = &["cli.json", "service.json", "tui.json"];
+
+/// Recognized global config file names. opencode merges all of them, so all
+/// are mounted read-only; a directory squatting on one of these names is not a
+/// config file and is skipped.
+const GLOBAL_CONFIG_FILES: &[&str] = &["opencode.jsonc", "opencode.json", "config.json"];
+
+/// Build the host-side read-only mounts for the global opencode config dir,
+/// creating the default config on first run if none exists yet.
 ///
-/// opencode merges every existing global config file (`opencode.jsonc`,
-/// `opencode.json`, `config.json` — jsonc winning on conflicts), so *all* of
-/// them are mounted read-only; leaving one writable would defeat the "never
-/// rewrite your own permissions" guarantee. Returns an empty vector (with a
-/// warning) when no config file could be created.
-fn opencode_config_mounts(config_dir: &Path) -> Result<Vec<String>> {
+/// In a locked run every existing entry is mounted read-only except regular
+/// `cli.json`, `service.json` and `tui.json`, which the TUI/server must be able
+/// to write. Symlinked entries are mounted read-only even with
+/// `--edit-config`: they point into the Nix store, so a writable mount could
+/// never work, and skipping the mount would expose a dangling symlink inside
+/// the container. Mounts are skipped for missing paths: mounting a nonexistent
+/// source would make Docker create a root-owned directory in the user's config
+/// tree.
+fn opencode_config_mounts(config_dir: &Path, edit_config: bool) -> Result<Vec<String>> {
+    let _ = seed_opencode_config(config_dir);
+
+    let entries = match fs::read_dir(config_dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!(
+                "Warning: could not read opencode config dir '{}' ({err:#}); skipping read-only config mounts.",
+                config_dir.display()
+            );
+            return Ok(Vec::new());
+        }
+    };
+
+    let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
+    entries.sort_by_key(|entry| entry.file_name());
+
     let mut mounts = Vec::new();
-    for name in ["opencode.jsonc", "opencode.json", "config.json"] {
-        let path = config_dir.join(name);
-        if path.is_file() {
-            mounts.push(format!(
-                "{}:/opencode/config/opencode/{}:ro",
-                path.display(),
-                name
-            ));
+    for entry in entries {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let path = entry.path();
+        let is_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(false);
+
+        if edit_config && !is_symlink {
+            continue;
         }
-    }
-    if mounts.is_empty() {
-        // No global config yet: seed the default so a locked run still has
-        // something to protect (and mount it).
-        if let Some(file) = seed_opencode_config(config_dir) {
-            let name = file
-                .file_name()
-                .context("config file has no filename")?
-                .to_string_lossy();
-            mounts.push(format!(
-                "{}:/opencode/config/opencode/{}:ro",
-                file.display(),
-                name
-            ));
+        if !edit_config && !is_symlink && RUNTIME_WRITABLE_CONFIG.contains(&name.as_ref()) {
+            continue;
         }
+        if GLOBAL_CONFIG_FILES.contains(&name.as_ref()) && path.is_dir() {
+            continue;
+        }
+        if !path.exists() {
+            // Broken symlink: there is no readable target to mount, and
+            // mounting it would shadow the host entry.
+            eprintln!(
+                "Warning: '{}' is not a readable config entry; skipping its read-only mount.",
+                path.display()
+            );
+            continue;
+        }
+        if !path.is_file() && !path.is_dir() {
+            continue;
+        }
+        // Resolve Nix-managed symlinks so the mount source is the store path
+        // itself rather than relying on Docker to follow the link.
+        let source = match path.canonicalize() {
+            Ok(source) => source,
+            Err(err) => {
+                eprintln!(
+                    "Warning: could not resolve config entry '{}' ({err:#}); skipping its read-only mount.",
+                    path.display()
+                );
+                continue;
+            }
+        };
+
+        mounts.push(format!(
+            "{}:/opencode/config/opencode/{}:ro",
+            source.display(),
+            name
+        ));
     }
     Ok(mounts)
-}
-
-/// Push a read-only mount for `dir` as `host:/opencode/config/opencode/<name>:ro`,
-/// skipping (with a warning) when the host-side dir does not exist: mounting a
-/// nonexistent source would make Docker create a root-owned directory in the
-/// user's config tree.
-fn push_ro_dir_mount(da: &mut DockerArgs, dir: &Path, name: &str) {
-    if !dir.is_dir() {
-        eprintln!(
-            "Warning: '{}' is missing; skipping the read-only mount for {name}.",
-            dir.display()
-        );
-        return;
-    }
-    da.args.push("-v".into());
-    da.args.push(format!(
-        "{}:/opencode/config/opencode/{}:ro",
-        dir.display(),
-        name
-    ));
-}
-
-/// Read-only mounts (`host:/opencode/config/opencode/<name>:ro`) for every
-/// existing file among `names` in `config_dir`, e.g. the npm package
-/// manifests. Missing files are skipped: there is nothing to protect, and
-/// mounting a nonexistent source would create a shadowing directory.
-fn existing_file_mounts(config_dir: &Path, names: &[&str]) -> Vec<String> {
-    names
-        .iter()
-        .filter(|name| config_dir.join(name).is_file())
-        .map(|name| {
-            format!(
-                "{}:/opencode/config/opencode/{}:ro",
-                config_dir.join(name).display(),
-                name
-            )
-        })
-        .collect()
 }
 
 /// Seed the default opencode config if none exists, logging a warning when
@@ -509,6 +497,7 @@ fn ensure_opencode_config(config_dir: &Path) -> Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn new_args_empty() {
@@ -615,10 +604,12 @@ mod tests {
     }
 
     #[test]
-    fn xdg_dirs_edit_config_skips_readonly_mounts() {
-        // `--edit-config` is the deliberate escape hatch: the config files,
-        // plugins dir and npm plugin surface are left writable (no ro mounts)
-        // so config and plugins can be edited from inside the container.
+    fn xdg_dirs_edit_config_skips_regular_readonly_mounts() {
+        // `--edit-config` is the deliberate escape hatch: regular config
+        // files, the plugins dir and the npm plugin surface are left writable
+        // (no ro mounts) so config and plugins can be edited from inside the
+        // container. Nix-managed symlinks are covered by the unit tests; they
+        // stay read-only even in this mode.
         let tmp = tempfile::tempdir().unwrap();
         let mut da = DockerArgs::new();
         da.xdg_dirs(tmp.path(), true).unwrap();
@@ -674,13 +665,14 @@ mod tests {
     fn config_mounts_seed_default_when_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("opencode");
-        let mounts = opencode_config_mounts(&dir).unwrap();
+        let mounts = opencode_config_mounts(&dir, false).unwrap();
         assert_eq!(mounts.len(), 1);
         assert!(mounts[0].ends_with(":/opencode/config/opencode/opencode.jsonc:ro"));
         assert!(mounts[0].starts_with(&dir.display().to_string()));
         let content = fs::read_to_string(dir.join("opencode.jsonc")).unwrap();
         assert!(content.contains("\"permissions\""));
-        assert!(content.contains("\"experimental\""));
+        assert!(content.contains("\"policies\""));
+        assert!(!content.contains("\"experimental\""));
         // The seed is deliberately minimal: the V2 base policy already allows
         // everything by default (asking only for external directories and
         // `.env` reads), so on top of it the seed ships two global rules and
@@ -713,20 +705,20 @@ mod tests {
         // be lifted by project configs or saved approvals. Cargo's credential
         // files and the session DB are read-denied too, not just asked about.
         for rule in [
-            "{ \"action\": \"permission\", \"resource\": \"edit:/opencode/data/opencode/auth.json\", \"effect\": \"deny\" }",
-            "{ \"action\": \"permission\", \"resource\": \"read:/opencode/data/opencode/auth.json\", \"effect\": \"deny\" }",
-            "{ \"action\": \"permission\", \"resource\": \"edit:/opencode/data/opencode/account.json\", \"effect\": \"deny\" }",
-            "{ \"action\": \"permission\", \"resource\": \"read:/opencode/data/opencode/account.json\", \"effect\": \"deny\" }",
-            "{ \"action\": \"permission\", \"resource\": \"edit:/opencode/config/opencode/service.json\", \"effect\": \"deny\" }",
-            "{ \"action\": \"permission\", \"resource\": \"read:/opencode/config/opencode/service.json\", \"effect\": \"deny\" }",
-            "{ \"action\": \"permission\", \"resource\": \"edit:/opencode/state/opencode/service.json\", \"effect\": \"deny\" }",
-            "{ \"action\": \"permission\", \"resource\": \"read:/opencode/state/opencode/service.json\", \"effect\": \"deny\" }",
-            "{ \"action\": \"permission\", \"resource\": \"read:/opencode/cargo/credentials*\", \"effect\": \"deny\" }",
-            "{ \"action\": \"permission\", \"resource\": \"read:/opencode/config/git/*\", \"effect\": \"deny\" }",
-            "{ \"action\": \"permission\", \"resource\": \"edit:/opencode/data/opencode/shell/*\", \"effect\": \"deny\" }",
-            "{ \"action\": \"permission\", \"resource\": \"edit:/opencode/data/opencode/tool-output/*\", \"effect\": \"deny\" }",
-            "{ \"action\": \"permission\", \"resource\": \"edit:/opencode/data/opencode/opencode.db*\", \"effect\": \"deny\" }",
-            "{ \"action\": \"permission\", \"resource\": \"read:/opencode/data/opencode/opencode.db*\", \"effect\": \"deny\" }",
+            "{ \"action\": \"tool.use\", \"resource\": \"edit:/opencode/data/opencode/auth.json\", \"effect\": \"deny\" }",
+            "{ \"action\": \"tool.use\", \"resource\": \"read:/opencode/data/opencode/auth.json\", \"effect\": \"deny\" }",
+            "{ \"action\": \"tool.use\", \"resource\": \"edit:/opencode/data/opencode/account.json\", \"effect\": \"deny\" }",
+            "{ \"action\": \"tool.use\", \"resource\": \"read:/opencode/data/opencode/account.json\", \"effect\": \"deny\" }",
+            "{ \"action\": \"tool.use\", \"resource\": \"edit:/opencode/config/opencode/service.json\", \"effect\": \"deny\" }",
+            "{ \"action\": \"tool.use\", \"resource\": \"read:/opencode/config/opencode/service.json\", \"effect\": \"deny\" }",
+            "{ \"action\": \"tool.use\", \"resource\": \"edit:/opencode/state/opencode/service.json\", \"effect\": \"deny\" }",
+            "{ \"action\": \"tool.use\", \"resource\": \"read:/opencode/state/opencode/service.json\", \"effect\": \"deny\" }",
+            "{ \"action\": \"tool.use\", \"resource\": \"read:/opencode/cargo/credentials*\", \"effect\": \"deny\" }",
+            "{ \"action\": \"tool.use\", \"resource\": \"read:/opencode/config/git/*\", \"effect\": \"deny\" }",
+            "{ \"action\": \"tool.use\", \"resource\": \"edit:/opencode/data/opencode/shell/*\", \"effect\": \"deny\" }",
+            "{ \"action\": \"tool.use\", \"resource\": \"edit:/opencode/data/opencode/tool-output/*\", \"effect\": \"deny\" }",
+            "{ \"action\": \"tool.use\", \"resource\": \"edit:/opencode/data/opencode/opencode.db*\", \"effect\": \"deny\" }",
+            "{ \"action\": \"tool.use\", \"resource\": \"read:/opencode/data/opencode/opencode.db*\", \"effect\": \"deny\" }",
         ] {
             assert!(content.contains(rule), "missing seeded policy: {rule}");
         }
@@ -742,7 +734,7 @@ mod tests {
         let dir = tmp.path().join("opencode");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("opencode.jsonc"), "{\"model\":\"x\"}").unwrap();
-        let mounts = opencode_config_mounts(&dir).unwrap();
+        let mounts = opencode_config_mounts(&dir, false).unwrap();
         assert_eq!(mounts.len(), 1);
         assert!(mounts[0].ends_with(":/opencode/config/opencode/opencode.jsonc:ro"));
         assert_eq!(
@@ -760,7 +752,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("opencode.json"), "{\"model\":\"y\"}").unwrap();
         fs::write(dir.join("config.json"), "{\"model\":\"c\"}").unwrap();
-        let mounts = opencode_config_mounts(&dir).unwrap();
+        let mounts = opencode_config_mounts(&dir, false).unwrap();
         assert_eq!(mounts.len(), 2);
         assert!(mounts.iter().any(|m| m.ends_with("opencode.json:ro")));
         assert!(mounts.iter().any(|m| m.ends_with("config.json:ro")));
@@ -770,7 +762,7 @@ mod tests {
         );
         // When a jsonc appears later it is mounted too, on top of the others.
         fs::write(dir.join("opencode.jsonc"), "{\"model\":\"z\"}").unwrap();
-        let mounts = opencode_config_mounts(&dir).unwrap();
+        let mounts = opencode_config_mounts(&dir, false).unwrap();
         assert_eq!(mounts.len(), 3);
         assert!(mounts.iter().any(|m| m.ends_with("opencode.jsonc:ro")));
         assert_eq!(
@@ -786,7 +778,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let blocker = tmp.path().join("opencode");
         fs::write(&blocker, "x").unwrap();
-        assert!(opencode_config_mounts(&blocker).unwrap().is_empty());
+        assert!(opencode_config_mounts(&blocker, false).unwrap().is_empty());
     }
 
     #[test]
@@ -797,20 +789,141 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("opencode");
         fs::create_dir_all(dir.join("opencode.jsonc")).unwrap();
-        assert!(opencode_config_mounts(&dir).unwrap().is_empty());
+        assert!(opencode_config_mounts(&dir, false).unwrap().is_empty());
+    }
+
+    fn has_mount(mounts: &[String], name: &str) -> bool {
+        mounts
+            .iter()
+            .any(|m| m.ends_with(&format!(":/opencode/config/opencode/{name}:ro")))
     }
 
     #[test]
-    fn existing_file_mounts_only_existing() {
+    fn config_mounts_locked_mode_mounts_entries_but_not_runtime_files() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("package.json"), "{}").unwrap();
-        fs::write(tmp.path().join("bun.lock"), "").unwrap();
-        let mounts = existing_file_mounts(
-            tmp.path(),
-            &["package.json", "package-lock.json", "bun.lock"],
+        let dir = tmp.path().join("opencode");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("opencode.jsonc"), "{}").unwrap();
+        for name in [
+            "cli.json",
+            "service.json",
+            "tui.json",
+            "AGENTS.md",
+            "package.json",
+        ] {
+            fs::write(dir.join(name), "{}").unwrap();
+        }
+        fs::create_dir_all(dir.join("assets")).unwrap();
+        fs::write(dir.join("assets/church-bell.mp3"), "").unwrap();
+        fs::create_dir_all(dir.join("plugins")).unwrap();
+        fs::create_dir_all(dir.join("node_modules")).unwrap();
+
+        let mounts = opencode_config_mounts(&dir, false).unwrap();
+        for name in [
+            "opencode.jsonc",
+            "AGENTS.md",
+            "package.json",
+            "assets",
+            "plugins",
+            "node_modules",
+        ] {
+            assert!(
+                has_mount(&mounts, name),
+                "missing read-only mount for {name}: {mounts:?}"
+            );
+        }
+        for name in ["cli.json", "service.json", "tui.json"] {
+            assert!(
+                !has_mount(&mounts, name),
+                "runtime file {name} should stay writable: {mounts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_mounts_locked_mode_mounts_symlinked_runtime_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("opencode");
+        let store = tmp.path().join("store");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&store).unwrap();
+        fs::write(dir.join("opencode.jsonc"), "{}").unwrap();
+        fs::write(store.join("cli.json"), "{}").unwrap();
+        symlink(store.join("cli.json"), dir.join("cli.json")).unwrap();
+
+        let mounts = opencode_config_mounts(&dir, false).unwrap();
+        assert!(
+            has_mount(&mounts, "cli.json"),
+            "symlinked cli.json must be mounted read-only: {mounts:?}"
         );
-        assert_eq!(mounts.len(), 2);
-        assert!(mounts[0].ends_with(":/opencode/config/opencode/package.json:ro"));
-        assert!(mounts[1].ends_with(":/opencode/config/opencode/bun.lock:ro"));
+        assert!(
+            mounts
+                .iter()
+                .any(|m| m.starts_with(&store.display().to_string())),
+            "the mount source should be the resolved store path: {mounts:?}"
+        );
+    }
+
+    #[test]
+    fn config_mounts_edit_config_mounts_only_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("opencode");
+        let store = tmp.path().join("store");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&store).unwrap();
+        fs::write(dir.join("opencode.jsonc"), "{}").unwrap();
+        fs::write(dir.join("cli.json"), "{}").unwrap();
+        fs::create_dir_all(dir.join("assets")).unwrap();
+        fs::write(store.join("AGENTS.md"), "rules").unwrap();
+        symlink(store.join("AGENTS.md"), dir.join("AGENTS.md")).unwrap();
+
+        let mounts = opencode_config_mounts(&dir, true).unwrap();
+        assert!(
+            has_mount(&mounts, "AGENTS.md"),
+            "Nix-managed symlink must stay read-only with --edit-config: {mounts:?}"
+        );
+        for name in ["opencode.jsonc", "cli.json", "assets"] {
+            assert!(
+                !has_mount(&mounts, name),
+                "regular {name} should stay writable with --edit-config: {mounts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_mounts_edit_config_mounts_symlinked_runtime_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("opencode");
+        let store = tmp.path().join("store");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&store).unwrap();
+        fs::write(dir.join("opencode.jsonc"), "{}").unwrap();
+        fs::write(store.join("cli.json"), "{}").unwrap();
+        symlink(store.join("cli.json"), dir.join("cli.json")).unwrap();
+
+        let mounts = opencode_config_mounts(&dir, true).unwrap();
+        assert!(
+            has_mount(&mounts, "cli.json"),
+            "symlinked cli.json must stay read-only with --edit-config: {mounts:?}"
+        );
+        assert!(
+            !has_mount(&mounts, "opencode.jsonc"),
+            "regular config must stay writable with --edit-config: {mounts:?}"
+        );
+    }
+
+    #[test]
+    fn config_mounts_skip_broken_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("opencode");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("opencode.jsonc"), "{}").unwrap();
+        symlink(dir.join("missing"), dir.join("AGENTS.md")).unwrap();
+
+        let mounts = opencode_config_mounts(&dir, false).unwrap();
+        assert!(
+            !has_mount(&mounts, "AGENTS.md"),
+            "broken symlinks must be skipped: {mounts:?}"
+        );
     }
 }

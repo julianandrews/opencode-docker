@@ -2,12 +2,13 @@
   // Default OpenCode configuration seeded by opencode-docker on first run
   // (source of truth for src/docker.rs: DEFAULT_OPENCODE_CONFIG).
   //
-  // Edit this file on the HOST. In a normal (locked) run the config files,
-  // plugins dir, node_modules and package manifests are additionally mounted
-  // read-only, so an agent cannot change its own permissions or config even
-  // via shell. With --edit-config those mounts are skipped: this file is then
-  // tool-level guidance only, and the sandbox is the real security. The deny
-  // policies below survive any project-level config or approval either way.
+  // Edit this file on the HOST. In a normal (locked) run every config entry is
+  // additionally mounted read-only (except the regular runtime-writable
+  // cli.json, service.json and tui.json), so an agent cannot change its own
+  // permissions
+  // or config even via shell. Nix-managed symlinks are mounted read-only even
+  // with --edit-config; regular config files are writable in that mode. The
+  // deny policies below survive project-level config and approvals either way.
   "$schema": "https://opencode.ai/config.json",
 
   // --- Permissions (V2 rules; ordered, last match wins) ---
@@ -45,28 +46,26 @@
   // config, the session database, and the shell/tool output archives -- from
   // the agent's tools. All denies are silent, so this layer costs nothing in
   // normal work.
-  "experimental": {
-    "policies": [
-      { "action": "permission", "resource": "edit:/opencode/data/opencode/auth.json", "effect": "deny" },
-      { "action": "permission", "resource": "edit:/opencode/data/opencode/account.json", "effect": "deny" },
-      { "action": "permission", "resource": "edit:/opencode/config/opencode/service.json", "effect": "deny" },
-      { "action": "permission", "resource": "read:/opencode/config/opencode/service.json", "effect": "deny" },
-      { "action": "permission", "resource": "read:/opencode/data/opencode/auth.json", "effect": "deny" },
-      { "action": "permission", "resource": "read:/opencode/data/opencode/account.json", "effect": "deny" },
-      // Cargo registry credentials (crates.io tokens) are host secrets: hard-
-      // deny their read instead of asking so they never reach the agent.
-      { "action": "permission", "resource": "read:/opencode/cargo/credentials*", "effect": "deny" },
-      // The host git config (ro-mounted at /opencode/config/git) can embed
-      // credentials (insteadOf URLs, http.extraheader headers): read-deny it.
-      { "action": "permission", "resource": "read:/opencode/config/git/*", "effect": "deny" },
-      { "action": "permission", "resource": "edit:/opencode/data/opencode/shell/*", "effect": "deny" },
-      { "action": "permission", "resource": "edit:/opencode/data/opencode/tool-output/*", "effect": "deny" },
-      { "action": "permission", "resource": "read:/opencode/state/opencode/service.json", "effect": "deny" },
-      { "action": "permission", "resource": "edit:/opencode/state/opencode/service.json", "effect": "deny" },
-      { "action": "permission", "resource": "edit:/opencode/data/opencode/opencode.db*", "effect": "deny" },
-      // Reading the session DB would pull every prior session into context:
-      // read-deny it too (shell access is unaffected).
-      { "action": "permission", "resource": "read:/opencode/data/opencode/opencode.db*", "effect": "deny" }
-    ]
-  }
+  "policies": [
+    { "action": "tool.use", "resource": "edit:/opencode/data/opencode/auth.json", "effect": "deny" },
+    { "action": "tool.use", "resource": "edit:/opencode/data/opencode/account.json", "effect": "deny" },
+    { "action": "tool.use", "resource": "edit:/opencode/config/opencode/service.json", "effect": "deny" },
+    { "action": "tool.use", "resource": "read:/opencode/config/opencode/service.json", "effect": "deny" },
+    { "action": "tool.use", "resource": "read:/opencode/data/opencode/auth.json", "effect": "deny" },
+    { "action": "tool.use", "resource": "read:/opencode/data/opencode/account.json", "effect": "deny" },
+    // Cargo registry credentials (crates.io tokens) are host secrets: hard-
+    // deny their read instead of asking so they never reach the agent.
+    { "action": "tool.use", "resource": "read:/opencode/cargo/credentials*", "effect": "deny" },
+    // The host git config (ro-mounted at /opencode/config/git) can embed
+    // credentials (insteadOf URLs, http.extraheader headers): read-deny it.
+    { "action": "tool.use", "resource": "read:/opencode/config/git/*", "effect": "deny" },
+    { "action": "tool.use", "resource": "edit:/opencode/data/opencode/shell/*", "effect": "deny" },
+    { "action": "tool.use", "resource": "edit:/opencode/data/opencode/tool-output/*", "effect": "deny" },
+    { "action": "tool.use", "resource": "read:/opencode/state/opencode/service.json", "effect": "deny" },
+    { "action": "tool.use", "resource": "edit:/opencode/state/opencode/service.json", "effect": "deny" },
+    { "action": "tool.use", "resource": "edit:/opencode/data/opencode/opencode.db*", "effect": "deny" },
+    // Reading the session DB would pull every prior session into context:
+    // read-deny it too (shell access is unaffected).
+    { "action": "tool.use", "resource": "read:/opencode/data/opencode/opencode.db*", "effect": "deny" }
+  ]
 }

@@ -48,7 +48,7 @@ struct Cli {
         num_args = 0..=1,
         require_equals = true,
         default_missing_value = "true",
-        help = "Mount the opencode config dir fully read-write so config and plugins can be edited inside the container (default: the config files, plugins dir and package manifests are read-only). Use --edit-config=false to force locked mode even when a profile enables it"
+        help = "Make regular config files and the plugins dir writable so config and plugins can be edited inside the container (default: every config entry is read-only except the runtime-writable cli.json, service.json and tui.json). Nix-managed symlinks stay read-only even with --edit-config. Use --edit-config=false to force locked mode even when a profile enables it"
     )]
     edit_config: Option<bool>,
 
@@ -110,7 +110,7 @@ fn main() -> Result<()> {
             .map(|n| format!(" (via profile '{n}')"))
             .unwrap_or_default();
         eprintln!(
-            "\x1b[33mWarning: edit_config is enabled{via}: the opencode config files and plugins dir are writable in-container this run; agent writes persist to the host and all future runs.\x1b[0m"
+            "\x1b[33mWarning: edit_config is enabled{via}: regular opencode config files and the plugins dir are writable in-container this run; agent writes persist to the host and all future runs. Nix-managed symlinks stay read-only.\x1b[0m"
         );
     }
 

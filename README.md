@@ -170,7 +170,7 @@ What the default policy does:
   `/etc/shadow`'s root-only mode still apply). Real secrets are never asked about: credential files (`auth.json`,
   `account.json`, `service.json` in the config and state dirs, cargo's `credentials*`, and the host git config under
   `/opencode/config/git`, which can embed tokens in `insteadOf` URLs or `http.extraheader`) and the session database
-  are denied to the agent's tools outright by `experimental.policies`, and `*.env*` files keep prompting (opencode's
+  are denied to the agent's tools outright by the top-level `policies`, and `*.env*` files keep prompting (opencode's
   base policy). (opencode reads its own global config directory without prompting.)
 - **Tool reads and writes never prompt.** The seed replaces the base policy's `external_directory * -> ask` with a
   single catch-all `external_directory * -> allow`, covering the workspace, the tmpfs `/tmp`, the feature-toolchain
@@ -179,27 +179,30 @@ What the default policy does:
   index and crate sources, R's XDG dirs, `/opencode/cache/opencode`) are build cache and need no per-path rules.
 - **Plan mode keeps its scratch.** The built-in `plan` agent denies all edits except opencode plan files; the seed
   re-allows `edit /tmp/*` for that agent so plan mode can still write tmpfs scratch without touching persistent state.
-- **Agents can never modify their own setup.** Every existing global config file (`opencode.jsonc`, `opencode.json`,
-  `config.json` — opencode merges all of them) is bind-mounted **read-only** into the container, so even a compromised
-  agent cannot rewrite its permissions (in `--edit-config` runs those mounts are skipped by design — see below).
-  Hard `deny` policies (`experimental.policies`) additionally block tool reads/edits of the credential files, the
-  recorded shell/tool-output archives, `service.json` and the session database regardless of any approval. Policies
-  cannot be overridden by project configs or "allow always" approvals.
+- **Agents can never modify their own setup.** Every config entry is bind-mounted **read-only** into the container,
+  except the runtime-writable regular files `cli.json`, `service.json` and `tui.json`. Symlinked entries are mounted
+  read-only even in `--edit-config` runs: they point into the Nix store, where writes fail anyway, and keeping the
+  mount means a Nix-managed config stays visible instead of dangling. So even a compromised agent cannot rewrite its
+  permissions. Hard `deny` `policies` additionally block tool reads/edits of the credential files, the recorded
+  shell/tool-output archives, `service.json` and the session database regardless of any approval. Policies cannot be
+  overridden by project configs or "allow always" approvals.
 - **Shell runs without prompting** (V2's allow-by-default base policy keeps the agent productive); only `git push` is
   always denied.
 
 Edit permissions on the **host** (the global config files in `~/.config/opencode/`) — because they are mounted
 read-only, in-container commands that write global config (`opencode config set --global`, `opencode mcp add --global`)
-fail with a read-only filesystem error by design. `cli.json` and `service.json` stay writable (TUI settings, serve
-password). Plugin management is host-side too: `opencode plugin add` writes the global config, and the plugin surfaces —
-the discovery directory (`~/.config/opencode/plugins/`), `node_modules` and the package manifests — are mounted
-read-only, so a writable plugin target never exists for an agent to persist code that runs on every launch.
+fail with a read-only filesystem error by design. Regular `cli.json`, `service.json` and `tui.json` stay writable (TUI
+settings, serve password); a symlinked one is read-only like the rest. Plugin management is host-side too: `opencode
+plugin add` writes the global config, and the plugin surfaces — the discovery directory (`~/.config/opencode/plugins/`),
+`node_modules` and the package manifests — are mounted read-only, so a writable plugin target never exists for an agent
+to persist code that runs on every launch.
 
-Prefer editing from inside the container? Run with `--edit-config` (or set `edit_config = true` in a profile): it skips
-the read-only mounts for that run, so `opencode config set --global`, `opencode plugin add` and direct file edits work
-in-container and persist to the host config dir. Use it deliberately — in an `--edit-config` session an agent could also
-write those files via shell — and note that a profile turning it on prints a warning at launch; `--edit-config=false`
-forces locked mode back on even for such a profile.
+Prefer editing from inside the container? Run with `--edit-config` (or set `edit_config = true` in a profile): it makes
+regular config files and the plugins dir writable for that run, so `opencode config set --global`, `opencode plugin add`
+and direct file edits work in-container and persist to the host config dir. Nix-managed symlinks stay read-only (they
+could not be written anyway). Use it deliberately — in an `--edit-config` session an agent could also write regular
+config files via shell — and note that a profile turning it on prints a warning at launch; `--edit-config=false` forces
+locked mode back on even for such a profile.
 
 ### Known limitations
 
@@ -256,7 +259,7 @@ Notes:
 opencode-docker                          # run in the current directory
 opencode-docker -p myenv                 # use a profile
 opencode-docker --feature Rust           # enable Rust toolchain for this run
-opencode-docker --edit-config            # mount the config dir read-write for in-container config/plugin edits
+opencode-docker --edit-config            # make regular config files/plugins writable for in-container edits
 opencode-docker -P 8080 serve            # run `serve` (headless API + web), passing remaining args to opencode
 ```
 
